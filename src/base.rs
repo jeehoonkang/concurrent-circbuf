@@ -49,6 +49,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
+use std::thread;
 use std::sync::Arc;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering;
@@ -409,7 +410,10 @@ impl<T> CircBuf<T> {
 
             // Try incrementing rx to receive a value.
             match self.inner.rx.compare_exchange_weak(rx, rx.wrapping_add(1), Ordering::Relaxed, Ordering::Relaxed) {
-                Err(rx_cur) => rx = rx_cur,
+                Err(rx_cur) => {
+                    rx = rx_cur;
+                    thread::yield_now();
+                }
                 Ok(_) => unsafe {
                     let buf = self.inner.array.load(Ordering::Relaxed, epoch::unprotected());
                     let value = buf.deref().read(rx);
@@ -584,7 +588,9 @@ impl<T> Receiver<T> {
                 Err(rx_cur) => {
                     // We didn't receive this value, forget it.
                     mem::forget(value);
+
                     rx = rx_cur;
+                    thread::yield_now();
                 }
                 Ok(_) => {
                     return Some(value);
