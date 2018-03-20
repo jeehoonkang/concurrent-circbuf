@@ -1,7 +1,7 @@
 //! Unbounded SPSC and SPMC channels based on dynamically growable and shrinkable concurrent
 //! circular buffer.
 
-/// Unbounded SPSC channel based on dynamically growable and shrinkable circular buffer.
+/// Unbounded SPSC channel based on dynamically growable and shrinkable concurrent circular buffer.
 ///
 /// # Examples
 ///
@@ -27,11 +27,11 @@ pub mod spsc {
     use std::marker::PhantomData;
     use base;
 
-    /// The sender of an SPSC channel.
+    /// The sender of an unbounded SPSC channel.
     #[derive(Debug)]
     pub struct Sender<T>(base::DynamicCircBuf<T>);
 
-    /// The receiver of an SPSC channel.
+    /// The receiver of an unbounded SPSC channel.
     #[derive(Debug)]
     pub struct Receiver<T> {
         receiver: base::Receiver<T>,
@@ -40,7 +40,7 @@ pub mod spsc {
 
     unsafe impl<T> Send for Receiver<T> {}
 
-    /// Creates an SPSC channel, and returns its sender and receiver.
+    /// Creates an unbounded SPSC channel, and returns its sender and receiver.
     ///
     /// # Examples
     ///
@@ -60,7 +60,7 @@ pub mod spsc {
         (sender, receiver)
     }
 
-    /// Creates an SPSC channel with the specified minimal capacity, and returns its sender and
+    /// Creates an unbounded SPSC channel with the specified minimal capacity, and returns its sender and
     /// receiver.
     ///
     /// If the capacity is not a power of two, it will be rounded up to the next one.
@@ -123,7 +123,7 @@ pub mod spsc {
     }
 }
 
-/// Unbounded SPMC channel based on dynamically growable and shrinkable circular buffer.
+/// Unbounded SPMC channel based on dynamically growable and shrinkable concurrent circular buffer.
 ///
 /// # Examples
 ///
@@ -150,16 +150,16 @@ pub mod spmc {
     use base;
     pub use base::TryRecv;
 
-    /// An SPMC channel.
+    /// an unbounded SPMC channel.
     #[derive(Debug)]
     pub struct Channel<T>(base::DynamicCircBuf<T>);
 
-    /// The receiver of an SPMC channel.
+    /// The receiver of an unbounded SPMC channel.
     #[derive(Debug)]
     pub struct Receiver<T>(base::Receiver<T>);
 
     impl<T> Channel<T> {
-        /// Creates an SPMC channel.
+        /// Creates an unbounded SPMC channel.
         ///
         /// # Examples
         ///
@@ -174,7 +174,7 @@ pub mod spmc {
             }
         }
 
-        /// Creates an SPMC channel with the specified minimal capacity.
+        /// Creates an unbounded SPMC channel with the specified minimal capacity.
         ///
         /// If the capacity is not a power of two, it will be rounded up to the next one.
         ///

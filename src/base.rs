@@ -1,33 +1,35 @@
 //! A concurrent circular buffer.
 //!
-//! The data structure can be thought of as a dynamically growable and shrinkable buffer that has
-//! two ends: tx and rx. A [`CircBuf`] can [`send`] elements into the tx end and
-//! [`try_recv`][CircBuf::try_recv] elements from the rx end. A [`CircBuf`] doesn't implement `Sync`
-//! so it cannot be shared among multiple threads. However, it can create [`Receiver`]s, and those
-//! can be easily cloned, shared, and sent to other threads. [`Receiver`]s can only
-//! [`try_recv`][Receiver::try_recv] elements from the rx end.
+//! [`CircBuf`] is a circular buffer, which is basically a fixed-sized array that has two ends: tx
+//! and rx. A [`CircBuf`] can [`send`] elements into the tx end and [`try_recv`][CircBuf::try_recv]
+//! elements from the rx end. A [`CircBuf`] doesn't implement `Sync` so it cannot be shared among
+//! multiple threads. However, it can create [`Receiver`]s, and those can be easily cloned, shared,
+//! and sent to other threads. [`Receiver`]s can only [`try_recv`][Receiver::try_recv] elements from
+//! the rx end.
 //!
-//! Here's a visualization of the data structure:
+//! Here's a visualization of a [`CircBuf`] of capacity 4, consisting of 2 elements `a` and `b`.
 //!
 //! ```text
-//!                         rx
-//!                          _
-//!    CircBuf::try_recv -> | | <- Receiver::try_recv
-//!                         | |
-//!                         | |
-//!                         | |
-//!        CircBuf::send -> |_|
-//!
-//!                         tx
+//!    ___
+//!   | a | <- rx (CircBuf::try_recv, Receiver::try_recv)
+//!   | b |
+//!   |   | <- tx (CircBuf::send)
+//!   |   |
+//!    ¯¯¯
 //! ```
+//!
+//! [`DynamicCircBuf`] is a dynamically growable and shrinkable circular buffer. Internally,
+//! [`DynamicCircBuf`] has a [`CircBuf`], and resizes it when necessary.
+//!
 //!
 //! # Fair work-stealing schedulers
 //!
-//! Usually, the data structure is used in fair work-stealing schedulers as follows.
+//! Usually, the data structure is used in fair work-stealing schedulers for a number of threads as
+//! follows.
 //!
-//! There are a number of threads. Each thread owns a [`CircBuf`] and creates a [`Receiver`] that is
-//! shared among all other threads. Alternatively, it creates multiple [`Receiver`]s - one for each
-//! of the other threads.
+//! Each thread owns a [`CircBuf`] (or [`DynamicCircBuf`]) and creates a [`Receiver`] that is shared
+//! among all other threads. Alternatively, it creates multiple [`Receiver`]s - one for each of the
+//! other threads.
 //!
 //! Then, all threads are executing in a loop. In the loop, each one attempts to
 //! [`try_recv`][CircBuf::try_recv] some work from its own [`CircBuf`]. But if it is empty, it
@@ -40,6 +42,7 @@
 //! work repeatedly.
 //!
 //! [`CircBuf`]: struct.CircBuf.html
+//! [`DynamicCircBuf`]: struct.DynamicCircBuf.html
 //! [`Receiver`]: struct.Receiver.html
 //! [`send`]: struct.CircBuf.html#method.send
 //! [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
@@ -57,13 +60,7 @@ use std::sync::atomic::Ordering;
 use epoch::{self, Atomic, Owned};
 use utils::cache_padded::CachePadded;
 
-/// Minimum capacity for a circular buffer.
-const DEFAULT_MIN_CAP: usize = 16;
-
-/// If an array of at least this size is retired, thread-local garbage is flushed so that it gets
-/// deallocated as soon as possible.
-const FLUSH_THRESHOLD_BYTES: usize = 1 << 10;
-
+/// C++'s std::pair<T, U>.
 #[repr(C)]
 struct CPair<T, U> {
     pub first: T,
@@ -71,6 +68,7 @@ struct CPair<T, U> {
 }
 
 impl<T, U> CPair<T, U> {
+    /// C++'s std::make_pair<T, U>.
     pub fn new(first: T, second: U) -> Self {
         Self { first, second }
     }
@@ -78,7 +76,8 @@ impl<T, U> CPair<T, U> {
 
 /// An array that holds elements in a circular buffer.
 struct Array<T> {
-    /// Pointer to the allocated memory.
+    /// Pointer to the allocated memory. The value `(i, v)` means the `i`-th value `v` of the
+    /// buffer.
     ptr: *mut CPair<AtomicIsize, T>,
 
     /// Capacity of the array. Always a power of two.
@@ -90,17 +89,22 @@ unsafe impl<T> Send for Array<T> {}
 impl<T> Array<T> {
     /// Returns a new array with the specified capacity.
     fn new(cap: usize) -> Self {
+        // `cap` should be a power of two.
         debug_assert_eq!(cap, cap.next_power_of_two());
 
+        // Creates an array and gets its raw pointer.
         let mut v = Vec::with_capacity(cap);
         let ptr: *mut CPair<AtomicIsize, T> = v.as_mut_ptr();
         mem::forget(v);
 
+        // Mark all entries invalid. Concretely, for each entry at `i`, we put the index `i - 1`,
+        // which is invalid. This is because the `i`-th entry can contain only elements with the
+        // index `i + N * cap`, where `N` is an integer.
         unsafe {
             for i in 0..cap {
                 ptr::write(
                     ptr.offset(i as isize),
-                    CPair::new(AtomicIsize::new(i as isize + 1), mem::uninitialized()),
+                    CPair::new(AtomicIsize::new(i as isize - 1), mem::uninitialized()),
                 );
             }
         }
@@ -117,10 +121,14 @@ impl<T> Array<T> {
     /// Writes `value` into the specified `index`.
     unsafe fn write(&self, index: isize, value: T) {
         let ptr = self.at(index) as *const u8;
+
+        // Write the value.
         ptr::write(
             ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as *mut T,
             value,
         );
+
+        // Write the index with `Release`.
         (*(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const AtomicIsize))
             .store(index, Ordering::Release);
     }
@@ -130,11 +138,18 @@ impl<T> Array<T> {
     /// Returns `Some(v)` if `v` is at `index`, and `None` if there is no valid value for `index`.
     unsafe fn read(&self, index: isize) -> Option<T> {
         let ptr = self.at(index) as *const u8;
+
+        // Read the index with `Acquire`.
         let i = (*(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const AtomicIsize))
             .load(Ordering::Acquire);
+
+        // If the index written in the array mismatches with the queried index, there's no valid
+        // value.
         if index != i {
             return None;
         }
+
+        // Read the value.
         Some(ptr::read(
             ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as *const T,
         ))
@@ -143,19 +158,21 @@ impl<T> Array<T> {
 
 impl<T> Drop for Array<T> {
     fn drop(&mut self) {
+        // Array itself doesn't claim any ownership of the values.
         unsafe {
             drop(Vec::from_raw_parts(self.ptr, 0, self.cap));
         }
     }
 }
 
-/// Return type for [CircBuf::try_recv] and [Receiver::try_recv].
+/// The return type for [CircBuf::try_recv], [DynamicCircBuf::try_recv], and [Receiver::try_recv].
 ///
 /// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
+/// [DynamicCircBuf::try_recv]: struct.DynamicCircBuf.html#method.try_recv
 /// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TryRecv<T> {
-    /// Received data.
+    /// `try_recv` received an element.
     Data(T),
     /// The circular buffer is empty.
     Empty,
@@ -163,7 +180,18 @@ pub enum TryRecv<T> {
     Retry,
 }
 
-/// Internal data that is shared among a circular buffer and its receivers.
+impl<T> TryRecv<T> {
+    /// Apply a function to the content of `TryRecv::Data`.
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> TryRecv<U> {
+        match self {
+            TryRecv::Data(v) => TryRecv::Data(f(v)),
+            TryRecv::Empty => TryRecv::Empty,
+            TryRecv::Retry => TryRecv::Retry,
+        }
+    }
+}
+
+/// Internal data shared among a circular buffer and its receivers.
 struct Inner<T> {
     /// The rx index.
     rx: CachePadded<AtomicIsize>,
@@ -224,27 +252,19 @@ impl<T> Drop for Inner<T> {
 ///
 /// # Capacity
 ///
-/// The data structure dynamically grows and shrinks as elements are inserted and removed from
-/// it. If the internal array gets full, a new one twice the size of the original is
-/// allocated. Similarly, if it is less than a quarter full, a new array half the size of the
-/// original is allocated.
-///
-/// In order to prevent frequent resizing (reallocations may be costly), it is possible to specify a
-/// large minimum capacity for the circular buffer by calling [`CircBuf::with_min_capacity`]. This
-/// constructor will make sure that the internal array never shrinks below that size.
+/// The capacity of the data structure is fixed when created.
 ///
 /// [`CircBuf`]: struct.CircBuf.html
 /// [`Receiver`]: struct.Receiver.html
 /// [`send`]: struct.CircBuf.html#method.send
 /// [receiver]: struct.CircBuf.html#method.receiver
-/// [`CircBuf::with_min_capacity`]: struct.CircBuf.html#method.with_min_capacity
 /// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
 /// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
 pub struct CircBuf<T> {
     /// Internal data of the underlying circular buffer.
     inner: Arc<Inner<T>>,
 
-    /// The lower bound of the rx end.
+    /// The lower bound of the rx end in the view of the sender.
     rx_lb: Cell<isize>,
 
     _marker: PhantomData<*mut ()>, // !Send + !Sync
@@ -253,17 +273,17 @@ pub struct CircBuf<T> {
 unsafe impl<T: Send> Send for CircBuf<T> {}
 
 impl<T> CircBuf<T> {
-    /// Returns a new circular buffer with the specified minimum capacity.
+    /// Returns a new circular buffer with the specified capacity.
     ///
     /// If the capacity is not a power of two, it will be rounded up to the next one.
     ///
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::DynamicCircBuf;
+    /// use concurrent_circbuf::base::CircBuf;
     ///
-    /// // The minimum capacity will be rounded up to 1024.
-    /// let cb = DynamicCircBuf::<i32>::with_min_capacity(1000);
+    /// // The capacity will be rounded up to 1024.
+    /// let cb = CircBuf::<i32>::new(1000);
     /// ```
     pub fn new(cap: usize) -> CircBuf<T> {
         let power = cap.next_power_of_two();
@@ -278,17 +298,17 @@ impl<T> CircBuf<T> {
 
     /// Sends an element into the tx end of the circular buffer.
     ///
-    /// If the internal array is full, a new one twice the capacity of the current one will be
-    /// allocated.
+    /// Returns `Ok(())` if the element is successfully sent; and `Err(value)` if the circular
+    /// buffer is full and we failed to send `value`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::DynamicCircBuf;
+    /// use concurrent_circbuf::base::CircBuf;
     ///
-    /// let cb = DynamicCircBuf::new();
-    /// cb.send(1);
-    /// cb.send(2);
+    /// let cb = CircBuf::new(16);
+    /// cb.send(1).unwrap();
+    /// cb.send(2).unwrap();
     /// ```
     pub fn send(&self, value: T) -> Result<(), T> {
         self.send_inner(value).map_err(|(value, _, _)| value)
@@ -301,17 +321,14 @@ impl<T> CircBuf<T> {
     /// operation gets in the way while attempting to receive data, this method will bail out
     /// immediately with [`TryRecv::Retry`] instead of retrying.
     ///
-    /// If the internal array is less than a quarter full, a new array half the capacity of the
-    /// current one will be allocated.
-    ///
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
     ///
-    /// let cb = DynamicCircBuf::new();
-    /// cb.send(1);
-    /// cb.send(2);
+    /// let cb = CircBuf::new(16);
+    /// cb.send(1).unwrap();
+    /// cb.send(2).unwrap();
     ///
     /// // Attempt to receive an element.
     /// //
@@ -321,12 +338,17 @@ impl<T> CircBuf<T> {
     ///
     /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     pub fn try_recv(&self) -> TryRecv<T> {
-        self.try_recv_inner().0
+        self.try_recv_inner().map(|v| v.0)
     }
 
-    /// Helper for send. Returns `Err((value, tx, cap))` if the circular buffer is full, where
-    /// `value` is the sent value, `tx` is the current index of the tx end, and `cap` is the current
-    /// capacity of the array.
+    /// Helper function for [`CircBuf::send`] and [`DynamicCircBuf::send`].
+    ///
+    /// returns `Ok(())` if the element is successfully sent and `Err((value, tx, cap))` if the
+    /// circular buffer is full and we failed to send `value`, where `tx` is the current index of
+    /// the tx end and `cap` is the current capacity of the array.
+    ///
+    /// [`CircBuf::send`]: struct.CircBuf.html#method.send
+    /// [`DynamicCircBuf::send`]: struct.DynamicCircBuf.html#method.send
     #[inline]
     fn send_inner(&self, value: T) -> Result<(), (T, isize, usize)> {
         unsafe {
@@ -360,10 +382,16 @@ impl<T> CircBuf<T> {
         }
     }
 
-    /// Helper for try_recv. Returns `(r, Some(cap))` if `r` is the result of `try_recv()`, `cap` is
-    /// the current capacity of the array, and it's worth shrinking the array; and `(r, None)` if
-    /// `r` is the result of `try_recv()` and it's not worth shrinking the array.
-    pub fn try_recv_inner(&self) -> (TryRecv<T>, Option<usize>) {
+    /// Helper function for [`CircBuf::try_recv`] and [`DynamicCircBuf::try_recv`].
+    ///
+    /// The return value is similar to [`CircBuf::try_recv`], but `TryRecv::Data((value,
+    /// Some(cap)))` means `cap` is the current capacity of the array, and it's worth shrinking the
+    /// array; and `TryRecv::Data((value, None))` means it's not worth shrinking the array.
+    ///
+    /// [`CircBuf::try_recv`]: struct.CircBuf.html#method.try_recv
+    /// [`DynamicCircBuf::try_recv`]: struct.DynamicCircBuf.html#method.try_recv
+    #[inline]
+    fn try_recv_inner(&self) -> TryRecv<(T, Option<usize>)> {
         // Load tx and rx.
         let tx = self.inner.tx.load(Ordering::Relaxed);
         let rx = self.inner.rx.load(Ordering::Relaxed);
@@ -372,7 +400,7 @@ impl<T> CircBuf<T> {
         // Is the circular buffer empty?
         if len <= 0 {
             self.rx_lb.set(rx);
-            return (TryRecv::Empty, None);
+            return TryRecv::Empty;
         }
 
         // Try incrementing rx to receive a value.
@@ -383,7 +411,7 @@ impl<T> CircBuf<T> {
             .map_err(|rx_cur| self.rx_lb.set(rx_cur))
             .is_err()
         {
-            return (TryRecv::Retry, None);
+            return TryRecv::Retry;
         }
 
         // Set the lower bound of rx.
@@ -400,14 +428,13 @@ impl<T> CircBuf<T> {
 
             // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
             let cap = array.deref().cap;
-            let resize = 
-                if len <= cap as isize / 4 {
-                    Some(cap)
-                } else {
-                    None
-                };
+            let resize = if len <= cap as isize / 4 {
+                Some(cap)
+            } else {
+                None
+            };
 
-            (TryRecv::Data(value), resize)
+            TryRecv::Data((value, resize))
         }
     }
 
@@ -416,12 +443,12 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
     /// use std::thread;
     ///
-    /// let cb = DynamicCircBuf::new();
-    /// cb.send(1);
-    /// cb.send(2);
+    /// let cb = CircBuf::new(16);
+    /// cb.send(1).unwrap();
+    /// cb.send(2).unwrap();
     ///
     /// let r = cb.receiver();
     ///
@@ -446,12 +473,12 @@ impl<T> fmt::Debug for CircBuf<T> {
 /// A dynamic-sized concurrent circular buffer.
 ///
 /// A circular buffer has two ends: rx and tx. Elements can be [`send`]ed into the tx end and
-/// [`try_recv`][CircBuf::try_recv]ed from the rx end. The rx end is special in that receivers can
-/// also receive from the rx end using [`try_recv`][Receiver::try_recv] method.
+/// [`try_recv`][DynamicCircBuf::try_recv]ed from the rx end. The rx end is special in that
+/// receivers can also receive from the rx end using [`try_recv`][Receiver::try_recv] method.
 ///
 /// # Receivers
 ///
-/// While [`CircBuf`] doesn't implement `Sync`, it can create [`Receiver`]s using the method
+/// While [`DynamicCircBuf`] doesn't implement `Sync`, it can create [`Receiver`]s using the method
 /// [`receiver`][receiver], and those can be easily shared among multiple threads. [`Receiver`]s can
 /// only [`try_recv`][Receiver::try_recv] elements from the rx end of the circular buffer.
 ///
@@ -463,15 +490,16 @@ impl<T> fmt::Debug for CircBuf<T> {
 /// original is allocated.
 ///
 /// In order to prevent frequent resizing (reallocations may be costly), it is possible to specify a
-/// large minimum capacity for the circular buffer by calling [`CircBuf::with_min_capacity`]. This
-/// constructor will make sure that the internal array never shrinks below that size.
+/// large minimum capacity for the circular buffer by calling
+/// [`DynamicCircBuf::with_min_capacity`]. This constructor will make sure that the internal array
+/// never shrinks below that size.
 ///
-/// [`CircBuf`]: struct.CircBuf.html
+/// [`DynamicCircBuf`]: struct.DynamicCircBuf.html
 /// [`Receiver`]: struct.Receiver.html
-/// [`send`]: struct.CircBuf.html#method.send
-/// [receiver]: struct.CircBuf.html#method.receiver
-/// [`CircBuf::with_min_capacity`]: struct.CircBuf.html#method.with_min_capacity
-/// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
+/// [`send`]: struct.DynamicCircBuf.html#method.send
+/// [receiver]: struct.DynamicCircBuf.html#method.receiver
+/// [`DynamicCircBuf::with_min_capacity`]: struct.DynamicCircBuf.html#method.with_min_capacity
+/// [DynamicCircBuf::try_recv]: struct.DynamicCircBuf.html#method.try_recv
 /// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
 pub struct DynamicCircBuf<T> {
     /// The underlying circular buffer.
@@ -486,6 +514,13 @@ pub struct DynamicCircBuf<T> {
 unsafe impl<T: Send> Send for DynamicCircBuf<T> {}
 
 impl<T> DynamicCircBuf<T> {
+    /// Minimum capacity for a dynamic circular buffer.
+    const DEFAULT_MIN_CAP: usize = 1 << 4;
+
+    /// If an array of at least this size is retired, thread-local garbage is flushed so that it
+    /// gets deallocated as soon as possible.
+    const FLUSH_THRESHOLD_BYTES: usize = 1 << 10;
+
     /// Returns a new circular buffer.
     ///
     /// The internal array is destructed as soon as the circular buffer and all its receivers get
@@ -499,7 +534,7 @@ impl<T> DynamicCircBuf<T> {
     /// let cb = DynamicCircBuf::<i32>::new();
     /// ```
     pub fn new() -> DynamicCircBuf<T> {
-        Self::with_min_capacity(DEFAULT_MIN_CAP)
+        Self::with_min_capacity(Self::DEFAULT_MIN_CAP)
     }
 
     /// Returns a new circular buffer with the specified minimum capacity.
@@ -540,7 +575,8 @@ impl<T> DynamicCircBuf<T> {
     /// cb.send(2);
     /// ```
     pub fn send(&self, value: T) {
-        self.inner.send_inner(value)
+        self.inner
+            .send_inner(value)
             .unwrap_or_else(|(value, tx, cap)| unsafe {
                 // The circular buffer is full. Grow the array.
                 self.resize(2 * cap);
@@ -551,7 +587,10 @@ impl<T> DynamicCircBuf<T> {
 
                 // Write `value` into the right slot and increment `tx`.
                 array.deref().write(tx, value);
-                self.inner.inner.tx.store(tx.wrapping_add(1), Ordering::Release);
+                self.inner
+                    .inner
+                    .tx
+                    .store(tx.wrapping_add(1), Ordering::Release);
             })
     }
 
@@ -582,16 +621,19 @@ impl<T> DynamicCircBuf<T> {
     ///
     /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     pub fn try_recv(&self) -> TryRecv<T> {
-        let (r, resize) = self.inner.try_recv_inner();
-
-        // Shrink the array if it's worth.
-        if let Some(cap) = resize {
-            if cap > self.min_cap {
-                unsafe { self.resize(cap / 2); }
+        self.inner.try_recv_inner().map(|(r, resize)| {
+            // Shrinks the array if it's worth.
+            if let Some(cap) = resize {
+                if cap > self.min_cap {
+                    unsafe {
+                        self.resize(cap / 2);
+                    }
+                }
             }
-        }
 
-        r
+            // Returns the received element.
+            r
+        })
     }
 
     /// Creates a receiver that can be shared with other threads.
@@ -646,7 +688,7 @@ impl<T> DynamicCircBuf<T> {
 
         // If the array is very large, then flush the thread-local garbage in order to
         // deallocate it as soon as possible.
-        if mem::size_of::<T>() * new_cap >= FLUSH_THRESHOLD_BYTES {
+        if mem::size_of::<T>() * new_cap >= Self::FLUSH_THRESHOLD_BYTES {
             guard.flush();
         }
     }
@@ -745,8 +787,9 @@ impl<T> Receiver<T> {
     /// # Safety
     ///
     /// You have to guarantee that there are no concurrent receive operations, such as
-    /// [`CircBuf::try_recv`], [`Receiver::try_recv`], and [`recv_exclusive`]. In other words, other
-    /// receive operations should happen either before or after it.
+    /// [`CircBuf::try_recv`], [`DynamicCircBuf::try_recv`], [`Receiver::try_recv`], and
+    /// [`recv_exclusive`]. In other words, other receive operations should happen either before or
+    /// after it.
     ///
     /// This method will not attempt to resize the internal array.
     ///
@@ -767,6 +810,7 @@ impl<T> Receiver<T> {
     ///
     /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     /// [`CircBuf::try_recv`]: struct.CircBuf.html#method.try_recv
+    /// [`DynamicCircBuf::try_recv`]: struct.DynamicCircBuf.html#method.try_recv
     /// [`Receiver::try_recv`]: struct.Receiver.html#method.try_recv
     /// [`recv_exclusive`]: struct.Receiver.html#method.recv_exclusive
     pub unsafe fn recv_exclusive(&self) -> Option<T> {

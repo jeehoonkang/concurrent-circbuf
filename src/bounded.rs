@@ -1,7 +1,6 @@
-//! Bounded SPSC and SPMC channels based on dynamically growable and shrinkable concurrent
-//! circular buffer.
+//! Bounded SPSC and SPMC channels based on fixed-sized concurrent circular buffer.
 
-/// Bounded SPSC channel based on dynamically growable and shrinkable circular buffer.
+/// Bounded SPSC channel based on fixed-sized concurrent circular buffer.
 ///
 /// # Examples
 ///
@@ -27,11 +26,11 @@ pub mod spsc {
     use std::marker::PhantomData;
     use base;
 
-    /// The sender of an SPSC channel.
+    /// The sender of a bounded SPSC channel.
     #[derive(Debug)]
     pub struct Sender<T>(base::CircBuf<T>);
 
-    /// The receiver of an SPSC channel.
+    /// The receiver of a bounded SPSC channel.
     #[derive(Debug)]
     pub struct Receiver<T> {
         receiver: base::Receiver<T>,
@@ -40,7 +39,8 @@ pub mod spsc {
 
     unsafe impl<T> Send for Receiver<T> {}
 
-    /// Creates an SPSC channel with the specified capacity, and returns its sender and receiver.
+    /// Creates a bounded SPSC channel with the specified capacity, and returns its sender and
+    /// receiver.
     ///
     /// If the capacity is not a power of two, it will be rounded up to the next one.
     ///
@@ -101,7 +101,7 @@ pub mod spsc {
     }
 }
 
-/// Bounded SPMC channel based on dynamically growable and shrinkable circular buffer.
+/// Bounded SPMC channel based on fixed-sized concurrent circular buffer.
 ///
 /// # Examples
 ///
@@ -128,16 +128,16 @@ pub mod spmc {
     use base;
     pub use base::TryRecv;
 
-    /// An SPMC channel.
+    /// A bounded SPMC channel.
     #[derive(Debug)]
     pub struct Channel<T>(base::CircBuf<T>);
 
-    /// The receiver of an SPMC channel.
+    /// The receiver of a bounded SPMC channel.
     #[derive(Debug)]
     pub struct Receiver<T>(base::Receiver<T>);
 
     impl<T> Channel<T> {
-        /// Creates an SPMC channel with the specified capacity.
+        /// Creates a bounded SPMC channel with the specified capacity.
         ///
         /// If the capacity is not a power of two, it will be rounded up to the next one.
         ///
@@ -155,6 +155,9 @@ pub mod spmc {
         }
 
         /// Sends an element to the channel.
+        ///
+        /// Returns `Ok(())` if the element is successfully sent; and `Err(value)` if the circular
+        /// buffer is full and we failed to send `value`.
         ///
         /// # Examples
         ///
