@@ -715,8 +715,7 @@ impl<T> Receiver<T> {
         // Load the value at the rx end of the array.
         let value = {
             let guard = &epoch::pin();
-            // FIXME(jeehoonkang): the load from array can be consume.
-            let array = self.inner.array.load(Ordering::Acquire, guard);
+            let array = self.inner.array.load_consume(guard);
             match unsafe { array.deref().read(rx) } {
                 None => return TryRecv::Empty,
                 Some(value) => value,
@@ -777,8 +776,7 @@ impl<T> Receiver<T> {
         // Load the value at the rx end of the array.
         let value = {
             let guard = &epoch::pin();
-            // FIXME(jeehoonkang): the load from array can be consume.
-            let array = self.inner.array.load(Ordering::Acquire, guard);
+            let array = self.inner.array.load_consume(guard);
             match array.deref().read(rx) {
                 None => return None,
                 Some(value) => value,
