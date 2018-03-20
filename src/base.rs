@@ -78,7 +78,7 @@ impl<T, U> CPair<T, U> {
 /// An array that holds elements in a circular buffer.
 struct Array<T> {
     /// Pointer to the allocated memory.
-    ptr: *mut CPair<isize, T>,
+    ptr: *mut CPair<AtomicIsize, T>,
 
     /// Capacity of the array. Always a power of two.
     cap: usize,
@@ -92,14 +92,14 @@ impl<T> Array<T> {
         debug_assert_eq!(cap, cap.next_power_of_two());
 
         let mut v = Vec::with_capacity(cap);
-        let ptr: *mut CPair<isize, T> = v.as_mut_ptr();
+        let ptr: *mut CPair<AtomicIsize, T> = v.as_mut_ptr();
         mem::forget(v);
 
         unsafe {
             for i in 0..cap {
                 ptr::write(
                     ptr.offset(i as isize),
-                    CPair::new(i as isize + 1, mem::uninitialized()),
+                    CPair::new(AtomicIsize::new(i as isize + 1), mem::uninitialized()),
                 );
             }
         }
@@ -108,24 +108,34 @@ impl<T> Array<T> {
     }
 
     /// Returns a pointer to the element at the specified `index`.
-    unsafe fn at(&self, index: isize) -> *mut CPair<isize, T> {
+    unsafe fn at(&self, index: isize) -> *mut CPair<AtomicIsize, T> {
         // `self.cap` is always a power of two.
         self.ptr.offset(index & (self.cap - 1) as isize)
     }
 
     /// Writes `value` into the specified `index`.
     unsafe fn write(&self, index: isize, value: T) {
-        ptr::write(self.at(index), CPair::new(index, value))
+        let ptr = self.at(index) as *const u8;
+        ptr::write(
+            ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as *mut T,
+            value,
+        );
+        (*(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const AtomicIsize))
+            .store(index, Ordering::Release);
     }
 
     /// Reads a value from the specified `index`.
     unsafe fn read(&self, index: isize) -> Option<T> {
         let ptr = self.at(index) as *const u8;
-        let i = ptr::read(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const isize);
+        let i = (*(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const AtomicIsize))
+            .load(Ordering::Acquire);
         if index != i {
             return None;
         }
-        Some(ptr::read(ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as *const T))
+        Some(ptr::read(
+            ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as
+                *const T,
+        ))
     }
 }
 
