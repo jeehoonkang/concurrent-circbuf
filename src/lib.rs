@@ -1,4 +1,4 @@
-//! SPSC and SPMC channels based on dyamically growable and shrinkable circular buffer.
+//! Bounded and unbounded, SPSC and SPMC channels based on concurrent circular buffer.
 
 #![deny(missing_docs, warnings, missing_debug_implementations)]
 
@@ -10,5 +10,5 @@ extern crate memoffset;
 pub mod base;
 pub use base::TryRecv;
 
-pub mod spsc;
-pub mod spmc;
+pub mod bounded;
+pub mod unbounded;

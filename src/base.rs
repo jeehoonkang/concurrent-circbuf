@@ -126,6 +126,8 @@ impl<T> Array<T> {
     }
 
     /// Reads a value from the specified `index`.
+    ///
+    /// Returns `Some(v)` if `v` is at `index`, and `None` if there is no valid value for `index`.
     unsafe fn read(&self, index: isize) -> Option<T> {
         let ptr = self.at(index) as *const u8;
         let i = (*(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const AtomicIsize))
@@ -134,8 +136,7 @@ impl<T> Array<T> {
             return None;
         }
         Some(ptr::read(
-            ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as
-                *const T,
+            ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as *const T,
         ))
     }
 }
@@ -172,55 +173,17 @@ struct Inner<T> {
 
     /// The underlying array.
     array: Atomic<Array<T>>,
-
-    /// Minimum capacity of the array. Always a power of two.
-    min_cap: usize,
 }
 
 impl<T> Inner<T> {
     /// Returns a new `Inner` with minimum capacity of `min_cap` rounded to the next power of two.
-    fn new(min_cap: usize) -> Self {
-        let power = min_cap.next_power_of_two();
-        assert!(power >= min_cap, "capacity too large: {}", min_cap);
+    fn new(cap: usize) -> Self {
+        debug_assert_eq!(cap, cap.next_power_of_two());
+
         Inner {
             rx: CachePadded::new(AtomicIsize::new(0)),
             tx: CachePadded::new(AtomicIsize::new(0)),
-            array: Atomic::new(Array::new(power)),
-            min_cap: power,
-        }
-    }
-
-    /// Resizes the internal array to the new capacity of `new_cap`.
-    #[cold]
-    unsafe fn resize(&self, new_cap: usize) {
-        // Load rx, tx, and array.
-        let rx = self.rx.load(Ordering::Relaxed);
-        let tx = self.tx.load(Ordering::Relaxed);
-        let array = self.array.load(Ordering::Relaxed, epoch::unprotected());
-
-        // Allocate a new array.
-        let new = Array::new(new_cap);
-
-        // Copy data from the old array to the new one.
-        let mut i = rx;
-        while i != tx {
-            ptr::copy_nonoverlapping(array.deref().at(i), new.at(i), 1);
-            i = i.wrapping_add(1);
-        }
-
-        let guard = &epoch::pin();
-        let new = Owned::new(new).into_shared(guard);
-
-        // Store the new array.
-        self.array.store(new, Ordering::Release);
-
-        // Destroy the old array later.
-        guard.defer(move || array.into_owned());
-
-        // If the array is very large, then flush the thread-local garbage in order to
-        // deallocate it as soon as possible.
-        if mem::size_of::<T>() * new_cap >= FLUSH_THRESHOLD_BYTES {
-            guard.flush();
+            array: Atomic::new(Array::new(cap)),
         }
     }
 }
@@ -247,7 +210,7 @@ impl<T> Drop for Inner<T> {
     }
 }
 
-/// A concurrent circular buffer.
+/// A fixed-sized concurrent circular buffer.
 ///
 /// A circular buffer has two ends: rx and tx. Elements can be [`send`]ed into the tx end and
 /// [`try_recv`][CircBuf::try_recv]ed from the rx end. The rx end is special in that receivers can
@@ -278,30 +241,18 @@ impl<T> Drop for Inner<T> {
 /// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
 /// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
 pub struct CircBuf<T> {
+    /// Internal data of the underlying circular buffer.
     inner: Arc<Inner<T>>,
+
+    /// The lower bound of the rx end.
     rx_lb: Cell<isize>,
+
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
 
 unsafe impl<T: Send> Send for CircBuf<T> {}
 
 impl<T> CircBuf<T> {
-    /// Returns a new circular buffer.
-    ///
-    /// The internal array is destructed as soon as the circular buffer and all its receivers get
-    /// dropped.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_circbuf::base::CircBuf;
-    ///
-    /// let cb = CircBuf::<i32>::new();
-    /// ```
-    pub fn new() -> CircBuf<T> {
-        Self::with_min_capacity(DEFAULT_MIN_CAP)
-    }
-
     /// Returns a new circular buffer with the specified minimum capacity.
     ///
     /// If the capacity is not a power of two, it will be rounded up to the next one.
@@ -309,14 +260,17 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::CircBuf;
+    /// use concurrent_circbuf::base::DynamicCircBuf;
     ///
     /// // The minimum capacity will be rounded up to 1024.
-    /// let cb = CircBuf::<i32>::with_min_capacity(1000);
+    /// let cb = DynamicCircBuf::<i32>::with_min_capacity(1000);
     /// ```
-    pub fn with_min_capacity(min_cap: usize) -> CircBuf<T> {
-        CircBuf {
-            inner: Arc::new(Inner::new(min_cap)),
+    pub fn new(cap: usize) -> CircBuf<T> {
+        let power = cap.next_power_of_two();
+        assert!(power >= cap, "capacity too large: {}", cap);
+
+        Self {
+            inner: Arc::new(Inner::new(power)),
             rx_lb: Cell::new(0),
             _marker: PhantomData,
         }
@@ -330,47 +284,14 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::CircBuf;
+    /// use concurrent_circbuf::base::DynamicCircBuf;
     ///
-    /// let cb = CircBuf::new();
+    /// let cb = DynamicCircBuf::new();
     /// cb.send(1);
     /// cb.send(2);
     /// ```
-    pub fn send(&self, value: T) {
-        unsafe {
-            // Load rx, tx, and array. The array doesn't have to be epoch-protected because the
-            // current thread (the worker) is the only one that grows and shrinks it.
-            let mut array = self.inner.array.load(
-                Ordering::Relaxed,
-                epoch::unprotected(),
-            );
-            let tx = self.inner.tx.load(Ordering::Relaxed);
-            let rx_lb = self.rx_lb.get();
-
-            // Calculate the length and the capacity of the circular buffer.
-            let len = tx.wrapping_sub(rx_lb);
-            let cap = array.deref().cap;
-
-            // If the circular buffer is full, grow the underlying array.
-            if len >= cap as isize {
-                let rx = self.inner.rx.load(Ordering::Acquire);
-                self.rx_lb.set(rx);
-                let len = tx.wrapping_sub(rx);
-                let cap = array.deref().cap;
-
-                if len >= cap as isize {
-                    self.inner.resize(2 * cap);
-                    array = self.inner.array.load(
-                        Ordering::Relaxed,
-                        epoch::unprotected(),
-                    );
-                }
-            }
-
-            // Write `value` into the right slot and increment `tx`.
-            array.deref().write(tx, value);
-            self.inner.tx.store(tx.wrapping_add(1), Ordering::Release);
-        }
+    pub fn send(&self, value: T) -> Result<(), T> {
+        self.send_inner(value).map_err(|(value, _, _)| value)
     }
 
     /// Receives an element from the rx end of the circular buffer.
@@ -386,9 +307,9 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
+    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
     ///
-    /// let cb = CircBuf::new();
+    /// let cb = DynamicCircBuf::new();
     /// cb.send(1);
     /// cb.send(2);
     ///
@@ -400,6 +321,49 @@ impl<T> CircBuf<T> {
     ///
     /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     pub fn try_recv(&self) -> TryRecv<T> {
+        self.try_recv_inner().0
+    }
+
+    /// Helper for send. Returns `Err((value, tx, cap))` if the circular buffer is full, where
+    /// `value` is the sent value, `tx` is the current index of the tx end, and `cap` is the current
+    /// capacity of the array.
+    #[inline]
+    fn send_inner(&self, value: T) -> Result<(), (T, isize, usize)> {
+        unsafe {
+            // Load rx, tx, and array. The array doesn't have to be epoch-protected because the
+            // current thread (the worker) is the only one that grows and shrinks it.
+            let array = self.inner
+                .array
+                .load(Ordering::Relaxed, epoch::unprotected());
+            let tx = self.inner.tx.load(Ordering::Relaxed);
+            let rx_lb = self.rx_lb.get();
+
+            // Calculate the length and the capacity of the circular buffer.
+            let len = tx.wrapping_sub(rx_lb);
+            let cap = array.deref().cap;
+
+            // If the circular buffer is full, grow the underlying array.
+            if len >= cap as isize {
+                let rx = self.inner.rx.load(Ordering::Acquire);
+                self.rx_lb.set(rx);
+                let len = tx.wrapping_sub(rx);
+
+                if len >= cap as isize {
+                    return Err((value, tx, cap));
+                }
+            }
+
+            // Write `value` into the right slot and increment `tx`.
+            array.deref().write(tx, value);
+            self.inner.tx.store(tx.wrapping_add(1), Ordering::Release);
+            Ok(())
+        }
+    }
+
+    /// Helper for try_recv. Returns `(r, Some(cap))` if `r` is the result of `try_recv()`, `cap` is
+    /// the current capacity of the array, and it's worth shrinking the array; and `(r, None)` if
+    /// `r` is the result of `try_recv()` and it's not worth shrinking the array.
+    pub fn try_recv_inner(&self) -> (TryRecv<T>, Option<usize>) {
         // Load tx and rx.
         let tx = self.inner.tx.load(Ordering::Relaxed);
         let rx = self.inner.rx.load(Ordering::Relaxed);
@@ -407,35 +371,43 @@ impl<T> CircBuf<T> {
 
         // Is the circular buffer empty?
         if len <= 0 {
-            return TryRecv::Empty;
+            self.rx_lb.set(rx);
+            return (TryRecv::Empty, None);
         }
 
         // Try incrementing rx to receive a value.
+        let rx_new = rx.wrapping_add(1);
         if self.inner
             .rx
-            .compare_exchange_weak(rx, rx.wrapping_add(1), Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange_weak(rx, rx_new, Ordering::Relaxed, Ordering::Relaxed)
+            .map_err(|rx_cur| self.rx_lb.set(rx_cur))
             .is_err()
         {
-            return TryRecv::Retry;
+            return (TryRecv::Retry, None);
         }
+
+        // Set the lower bound of rx.
+        self.rx_lb.set(rx_new);
 
         // Load the value at the rx end of the array.
         unsafe {
-            let array = self.inner.array.load(
-                Ordering::Relaxed,
-                epoch::unprotected(),
-            );
+            let array = self.inner
+                .array
+                .load(Ordering::Relaxed, epoch::unprotected());
 
             // Because len > 0, we should read a valid value.
             let value = array.deref().read(rx).unwrap();
 
             // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
             let cap = array.deref().cap;
-            if cap > self.inner.min_cap && len <= cap as isize / 4 {
-                self.inner.resize(cap / 2);
-            }
+            let resize = 
+                if len <= cap as isize / 4 {
+                    Some(cap)
+                } else {
+                    None
+                };
 
-            TryRecv::Data(value)
+            (TryRecv::Data(value), resize)
         }
     }
 
@@ -444,10 +416,10 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
+    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
     /// use std::thread;
     ///
-    /// let cb = CircBuf::new();
+    /// let cb = DynamicCircBuf::new();
     /// cb.send(1);
     /// cb.send(2);
     ///
@@ -471,9 +443,218 @@ impl<T> fmt::Debug for CircBuf<T> {
     }
 }
 
-impl<T> Default for CircBuf<T> {
-    fn default() -> CircBuf<T> {
-        CircBuf::new()
+/// A dynamic-sized concurrent circular buffer.
+///
+/// A circular buffer has two ends: rx and tx. Elements can be [`send`]ed into the tx end and
+/// [`try_recv`][CircBuf::try_recv]ed from the rx end. The rx end is special in that receivers can
+/// also receive from the rx end using [`try_recv`][Receiver::try_recv] method.
+///
+/// # Receivers
+///
+/// While [`CircBuf`] doesn't implement `Sync`, it can create [`Receiver`]s using the method
+/// [`receiver`][receiver], and those can be easily shared among multiple threads. [`Receiver`]s can
+/// only [`try_recv`][Receiver::try_recv] elements from the rx end of the circular buffer.
+///
+/// # Capacity
+///
+/// The data structure dynamically grows and shrinks as elements are inserted and removed from
+/// it. If the internal array gets full, a new one twice the size of the original is
+/// allocated. Similarly, if it is less than a quarter full, a new array half the size of the
+/// original is allocated.
+///
+/// In order to prevent frequent resizing (reallocations may be costly), it is possible to specify a
+/// large minimum capacity for the circular buffer by calling [`CircBuf::with_min_capacity`]. This
+/// constructor will make sure that the internal array never shrinks below that size.
+///
+/// [`CircBuf`]: struct.CircBuf.html
+/// [`Receiver`]: struct.Receiver.html
+/// [`send`]: struct.CircBuf.html#method.send
+/// [receiver]: struct.CircBuf.html#method.receiver
+/// [`CircBuf::with_min_capacity`]: struct.CircBuf.html#method.with_min_capacity
+/// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
+/// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
+pub struct DynamicCircBuf<T> {
+    /// The underlying circular buffer.
+    inner: CircBuf<T>,
+
+    /// Minimum capacity of the array. Always a power of two.
+    min_cap: usize,
+
+    _marker: PhantomData<*mut ()>, // !Send + !Sync
+}
+
+unsafe impl<T: Send> Send for DynamicCircBuf<T> {}
+
+impl<T> DynamicCircBuf<T> {
+    /// Returns a new circular buffer.
+    ///
+    /// The internal array is destructed as soon as the circular buffer and all its receivers get
+    /// dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_circbuf::base::DynamicCircBuf;
+    ///
+    /// let cb = DynamicCircBuf::<i32>::new();
+    /// ```
+    pub fn new() -> DynamicCircBuf<T> {
+        Self::with_min_capacity(DEFAULT_MIN_CAP)
+    }
+
+    /// Returns a new circular buffer with the specified minimum capacity.
+    ///
+    /// If the capacity is not a power of two, it will be rounded up to the next one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_circbuf::base::DynamicCircBuf;
+    ///
+    /// // The minimum capacity will be rounded up to 1024.
+    /// let cb = DynamicCircBuf::<i32>::with_min_capacity(1000);
+    /// ```
+    pub fn with_min_capacity(cap: usize) -> DynamicCircBuf<T> {
+        let power = cap.next_power_of_two();
+        assert!(power >= cap, "capacity too large: {}", cap);
+
+        Self {
+            inner: CircBuf::new(power),
+            min_cap: power,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Sends an element into the tx end of the circular buffer.
+    ///
+    /// If the internal array is full, a new one twice the capacity of the current one will be
+    /// allocated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_circbuf::base::DynamicCircBuf;
+    ///
+    /// let cb = DynamicCircBuf::new();
+    /// cb.send(1);
+    /// cb.send(2);
+    /// ```
+    pub fn send(&self, value: T) {
+        self.inner.send_inner(value)
+            .unwrap_or_else(|(value, tx, cap)| unsafe {
+                // The circular buffer is full. Grow the array.
+                self.resize(2 * cap);
+                let array = self.inner
+                    .inner
+                    .array
+                    .load(Ordering::Relaxed, epoch::unprotected());
+
+                // Write `value` into the right slot and increment `tx`.
+                array.deref().write(tx, value);
+                self.inner.inner.tx.store(tx.wrapping_add(1), Ordering::Release);
+            })
+    }
+
+    /// Receives an element from the rx end of the circular buffer.
+    ///
+    /// It returns `TryRecv::Data(v)` if a value `v` is received, and `TryRecv::Empty` if the
+    /// circular buffer is empty. Unlike most methods in concurrent data structures, if another
+    /// operation gets in the way while attempting to receive data, this method will bail out
+    /// immediately with [`TryRecv::Retry`] instead of retrying.
+    ///
+    /// If the internal array is less than a quarter full, a new array half the capacity of the
+    /// current one will be allocated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    ///
+    /// let cb = DynamicCircBuf::new();
+    /// cb.send(1);
+    /// cb.send(2);
+    ///
+    /// // Attempt to receive an element.
+    /// //
+    /// // It should return `TryRecv::Data(v)` for a value `v`, or `Err(TryRecv::Retry)`.
+    /// assert_ne!(cb.try_recv(), TryRecv::Empty);
+    /// ```
+    ///
+    /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
+    pub fn try_recv(&self) -> TryRecv<T> {
+        let (r, resize) = self.inner.try_recv_inner();
+
+        // Shrink the array if it's worth.
+        if let Some(cap) = resize {
+            if cap > self.min_cap {
+                unsafe { self.resize(cap / 2); }
+            }
+        }
+
+        r
+    }
+
+    /// Creates a receiver that can be shared with other threads.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    /// use std::thread;
+    ///
+    /// let cb = DynamicCircBuf::new();
+    /// cb.send(1);
+    /// cb.send(2);
+    ///
+    /// let r = cb.receiver();
+    ///
+    /// thread::spawn(move || {
+    ///     assert_eq!(r.try_recv(), TryRecv::Data(1));
+    /// }).join().unwrap();
+    /// ```
+    pub fn receiver(&self) -> Receiver<T> {
+        self.inner.receiver()
+    }
+
+    /// Resizes the internal array to the new capacity of `new_cap`.
+    #[cold]
+    unsafe fn resize(&self, new_cap: usize) {
+        let inner = &self.inner.inner;
+        // Load rx, tx, and array.
+        let rx = inner.rx.load(Ordering::Relaxed);
+        let tx = inner.tx.load(Ordering::Relaxed);
+        let array = inner.array.load(Ordering::Relaxed, epoch::unprotected());
+
+        // Allocate a new array.
+        let new = Array::new(new_cap);
+
+        // Copy data from the old array to the new one.
+        let mut i = rx;
+        while i != tx {
+            ptr::copy_nonoverlapping(array.deref().at(i), new.at(i), 1);
+            i = i.wrapping_add(1);
+        }
+
+        let guard = &epoch::pin();
+        let new = Owned::new(new).into_shared(guard);
+
+        // Store the new array.
+        inner.array.store(new, Ordering::Release);
+
+        // Destroy the old array later.
+        guard.defer(move || array.into_owned());
+
+        // If the array is very large, then flush the thread-local garbage in order to
+        // deallocate it as soon as possible.
+        if mem::size_of::<T>() * new_cap >= FLUSH_THRESHOLD_BYTES {
+            guard.flush();
+        }
+    }
+}
+
+impl<T> fmt::Debug for DynamicCircBuf<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "DynamicCircBuf {{ ... }}")
     }
 }
 
@@ -508,9 +689,9 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
+    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
     ///
-    /// let cb = CircBuf::new();
+    /// let cb = DynamicCircBuf::new();
     /// let r = cb.receiver();
     /// cb.send(1);
     /// cb.send(2);
@@ -534,6 +715,7 @@ impl<T> Receiver<T> {
         // Load the value at the rx end of the array.
         let value = {
             let guard = &epoch::pin();
+            // FIXME(jeehoonkang): the load from array can be consume.
             let array = self.inner.array.load(Ordering::Acquire, guard);
             match unsafe { array.deref().read(rx) } {
                 None => return TryRecv::Empty,
@@ -572,9 +754,9 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
+    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
     ///
-    /// let cb = CircBuf::new();
+    /// let cb = DynamicCircBuf::new();
     /// let r = cb.receiver();
     /// cb.send(1);
     /// cb.send(2);
@@ -595,6 +777,7 @@ impl<T> Receiver<T> {
         // Load the value at the rx end of the array.
         let value = {
             let guard = &epoch::pin();
+            // FIXME(jeehoonkang): the load from array can be consume.
             let array = self.inner.array.load(Ordering::Acquire, guard);
             match array.deref().read(rx) {
                 None => return None,
@@ -636,7 +819,7 @@ mod tests {
     use epoch;
     use self::rand::Rng;
 
-    use super::{CircBuf, TryRecv};
+    use super::{DynamicCircBuf, TryRecv};
 
     fn retry<T, F: Fn() -> TryRecv<T>>(f: F) -> Option<T> {
         loop {
@@ -650,7 +833,7 @@ mod tests {
 
     #[test]
     fn smoke() {
-        let cb = CircBuf::new();
+        let cb = DynamicCircBuf::new();
         let r = cb.receiver();
 
         assert_eq!(retry(|| cb.try_recv()), None);
@@ -679,13 +862,15 @@ mod tests {
     fn try_recv_send() {
         const STEPS: usize = 50_000;
 
-        let cb = CircBuf::new();
+        let cb = DynamicCircBuf::new();
         let r = cb.receiver();
-        let t = thread::spawn(move || for i in 0..STEPS {
-            loop {
-                if let TryRecv::Data(v) = r.try_recv() {
-                    assert_eq!(i, v);
-                    break;
+        let t = thread::spawn(move || {
+            for i in 0..STEPS {
+                loop {
+                    if let TryRecv::Data(v) = r.try_recv() {
+                        assert_eq!(i, v);
+                        break;
+                    }
                 }
             }
         });
@@ -700,7 +885,7 @@ mod tests {
     fn stampede() {
         const COUNT: usize = 50_000;
 
-        let cb = CircBuf::new();
+        let cb = DynamicCircBuf::new();
 
         for i in 0..COUNT {
             cb.send(Box::new(i + 1));
@@ -739,7 +924,7 @@ mod tests {
     fn run_stress() {
         const COUNT: usize = 50_000;
 
-        let cb = CircBuf::new();
+        let cb = DynamicCircBuf::new();
         let done = Arc::new(AtomicBool::new(false));
         let hits = Arc::new(AtomicUsize::new(0));
 
@@ -749,9 +934,11 @@ mod tests {
                 let done = done.clone();
                 let hits = hits.clone();
 
-                thread::spawn(move || while !done.load(SeqCst) {
-                    if let TryRecv::Data(_) = r.try_recv() {
-                        hits.fetch_add(1, SeqCst);
+                thread::spawn(move || {
+                    while !done.load(SeqCst) {
+                        if let TryRecv::Data(_) = r.try_recv() {
+                            hits.fetch_add(1, SeqCst);
+                        }
                     }
                 })
             })
@@ -797,7 +984,7 @@ mod tests {
     fn no_starvation() {
         const COUNT: usize = 50_000;
 
-        let cb = CircBuf::new();
+        let cb = DynamicCircBuf::new();
         let done = Arc::new(AtomicBool::new(false));
 
         let (threads, hits): (Vec<_>, Vec<_>) = (0..8)
@@ -808,9 +995,11 @@ mod tests {
 
                 let t = {
                     let hits = hits.clone();
-                    thread::spawn(move || while !done.load(SeqCst) {
-                        if let TryRecv::Data(_) = r.try_recv() {
-                            hits.fetch_add(1, SeqCst);
+                    thread::spawn(move || {
+                        while !done.load(SeqCst) {
+                            if let TryRecv::Data(_) = r.try_recv() {
+                                hits.fetch_add(1, SeqCst);
+                            }
                         }
                     })
                 };
@@ -855,7 +1044,7 @@ mod tests {
             }
         }
 
-        let cb = CircBuf::new();
+        let cb = DynamicCircBuf::new();
 
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let remaining = Arc::new(AtomicUsize::new(COUNT));
@@ -868,9 +1057,11 @@ mod tests {
                 let r = cb.receiver();
                 let remaining = remaining.clone();
 
-                thread::spawn(move || for _ in 0..1000 {
-                    if let TryRecv::Data(_) = r.try_recv() {
-                        remaining.fetch_sub(1, SeqCst);
+                thread::spawn(move || {
+                    for _ in 0..1000 {
+                        if let TryRecv::Data(_) = r.try_recv() {
+                            remaining.fetch_sub(1, SeqCst);
+                        }
                     }
                 })
             })
