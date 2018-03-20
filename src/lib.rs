@@ -6,7 +6,7 @@ extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils as utils;
 
 pub mod base;
-pub use base::RecvError;
+pub use base::TryRecv;
 
 pub mod spsc;
 pub mod spmc;

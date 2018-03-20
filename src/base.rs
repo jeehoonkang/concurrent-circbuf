@@ -49,7 +49,6 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
-use std::thread;
 use std::sync::Arc;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering;
@@ -112,9 +111,16 @@ impl<T> Drop for Array<T> {
     }
 }
 
-/// Errors in receiving data.
+/// Return type for [CircBuf::try_recv] and [Receiver::try_recv].
+///
+/// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
+/// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvError {
+pub enum TryRecv<T> {
+    /// Received data.
+    Data(T),
+    /// The circular buffer is empty.
+    Empty,
     /// Lost the race for receiving data to another concurrent operation. Try again.
     Retry,
 }
@@ -324,10 +330,10 @@ impl<T> CircBuf<T> {
 
     /// Receives an element from the rx end of the circular buffer.
     ///
-    /// It returns `Ok(Some(v))` if a value `v` is received, and `Ok(None)` if the circular buffer
+    /// It returns `TryRecv::Data(v)` if a value `v` is received, and `TryRecv::Empty` if the circular buffer
     /// is empty. Unlike most methods in concurrent data structures, if another operation gets in
     /// the way while attempting to receive data, this method will bail out immediately with
-    /// [`RecvError::Retry`] instead of retrying.
+    /// [`TryRecv::Retry`] instead of retrying.
     ///
     /// If the internal array is less than a quarter full, a new array half the capacity of the
     /// current one will be allocated.
@@ -335,7 +341,7 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, RecvError};
+    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
     ///
     /// let cb = CircBuf::new();
     /// cb.send(1);
@@ -343,90 +349,41 @@ impl<T> CircBuf<T> {
     ///
     /// // Attempt to receive an element.
     /// //
-    /// // It should return `Ok(Some(v))` for a value `v`, or `Err(RecvError::Retry)`.
-    /// assert_ne!(cb.try_recv(), Ok(None));
+    /// // It should return `TryRecv::Data(v)` for a value `v`, or `Err(TryRecv::Retry)`.
+    /// assert_ne!(cb.try_recv(), TryRecv::Empty);
     /// ```
     ///
-    /// [`RecvError::Retry`]: enum.RecvError.html#variant.Retry
-    pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
+    /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
+    pub fn try_recv(&self) -> TryRecv<T> {
         let tx = self.inner.tx.load(Ordering::Relaxed);
         let rx = self.inner.rx.load(Ordering::Relaxed);
         let len = tx.wrapping_sub(rx);
 
         // Is the circular buffer empty?
         if len <= 0 {
-            return Ok(None);
+            return TryRecv::Empty;
         }
 
         // Try incrementing rx to receive a value.
-        self.inner.rx
+        if self.inner
+            .rx
             .compare_exchange_weak(rx, rx.wrapping_add(1), Ordering::Relaxed, Ordering::Relaxed)
-            .map(|_| unsafe {
-                let buf = self.inner.array.load(Ordering::Relaxed, epoch::unprotected());
-                let value = buf.deref().read(rx);
+            .is_err()
+        {
+            return TryRecv::Retry;
+        }
 
-                // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
-                let cap = buf.deref().cap;
-                if cap > self.inner.min_cap && len <= cap as isize / 4 {
-                    self.inner.resize(cap / 2);
-                }
+        unsafe {
+            let buf = self.inner.array.load(Ordering::Relaxed, epoch::unprotected());
+            let value = buf.deref().read(rx);
 
-                Some(value)
-            })
-            .map_err(|_| RecvError::Retry)
-    }
-
-    /// Receives an element from the rx end of the circular buffer.
-    ///
-    /// It returns `Some(v)` if a value `v` is received, and `None` if the circular buffer is empty.
-    ///
-    /// If the internal array is less than a quarter full, a new array half the capacity of the
-    /// current one will be allocated.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_circbuf::base::{CircBuf, RecvError};
-    ///
-    /// let cb = CircBuf::new();
-    /// cb.send(1);
-    /// cb.send(2);
-    ///
-    /// // Receive an element.
-    /// assert_eq!(cb.recv(), Some(1));
-    /// assert_eq!(cb.recv(), Some(2));
-    /// ```
-    pub fn recv(&self) -> Option<T> {
-        let tx = self.inner.tx.load(Ordering::Relaxed);
-        let mut rx = self.inner.rx.load(Ordering::Relaxed);
-
-        loop {
-            let len = tx.wrapping_sub(rx);
-
-            // Is the circular buffer empty?
-            if len <= 0 {
-                return None;
+            // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
+            let cap = buf.deref().cap;
+            if cap > self.inner.min_cap && len <= cap as isize / 4 {
+                self.inner.resize(cap / 2);
             }
 
-            // Try incrementing rx to receive a value.
-            match self.inner.rx.compare_exchange_weak(rx, rx.wrapping_add(1), Ordering::Relaxed, Ordering::Relaxed) {
-                Err(rx_cur) => {
-                    rx = rx_cur;
-                    thread::yield_now();
-                }
-                Ok(_) => unsafe {
-                    let buf = self.inner.array.load(Ordering::Relaxed, epoch::unprotected());
-                    let value = buf.deref().read(rx);
-
-                    // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
-                    let cap = buf.deref().cap;
-                    if cap > self.inner.min_cap && len <= cap as isize / 4 {
-                        self.inner.resize(cap / 2);
-                    }
-
-                    return Some(value);
-                }
-            }
+            TryRecv::Data(value)
         }
     }
 
@@ -435,7 +392,7 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::CircBuf;
+    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
     /// use std::thread;
     ///
     /// let cb = CircBuf::new();
@@ -445,7 +402,7 @@ impl<T> CircBuf<T> {
     /// let r = cb.receiver();
     ///
     /// thread::spawn(move || {
-    ///     assert_eq!(r.try_recv(), Ok(Some(1)));
+    ///     assert_eq!(r.try_recv(), TryRecv::Data(1));
     /// }).join().unwrap();
     /// ```
     pub fn receiver(&self) -> Receiver<T> {
@@ -489,17 +446,17 @@ unsafe impl<T: Send> Sync for Receiver<T> {}
 impl<T> Receiver<T> {
     /// Receives an element from the rx end of its circular buffer.
     ///
-    /// It returns `Ok(Some(v))` if a value `v` is received, and `Ok(None)` if the circular buffer
-    /// is empty. Unlike most methods in concurrent data structures, if another operation gets in
-    /// the way while attempting to receive data, this method will bail out immediately with
-    /// [`RecvError::Retry`] instead of retrying.
+    /// It returns `TryRecv::Data(v)` if a value `v` is received, and `TryRecv::Empty` if the
+    /// circular buffer is empty. Unlike most methods in concurrent data structures, if another
+    /// operation gets in the way while attempting to receive data, this method will bail out
+    /// immediately with [`TryRecv::Retry`] instead of retrying.
     ///
     /// This method will not attempt to resize the internal array.
     ///
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, RecvError};
+    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
     ///
     /// let cb = CircBuf::new();
     /// let r = cb.receiver();
@@ -509,22 +466,23 @@ impl<T> Receiver<T> {
     /// // Attempt to receive an element, but keep retrying if we get `Retry`.
     /// let stolen = loop {
     ///     match r.try_recv() {
-    ///         Ok(r) => break r,
-    ///         Err(RecvError::Retry) => {}
+    ///         TryRecv::Data(r) => break Some(r),
+    ///         TryRecv::Empty => break None,
+    ///         TryRecv::Retry => {}
     ///     }
     /// };
     /// assert_eq!(stolen, Some(1));
     /// ```
     ///
-    /// [`RecvError::Retry`]: enum.RecvError.html#variant.Retry
-    pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
+    /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
+    pub fn try_recv(&self) -> TryRecv<T> {
         // Load rx and tx.
         let rx = self.inner.rx.load(Ordering::Relaxed);
         let tx = self.inner.tx.load(Ordering::Acquire);
 
         // Is the circular buffer empty?
         if tx.wrapping_sub(rx) <= 0 {
-            return Ok(None);
+            return TryRecv::Empty;
         }
 
         // Load array and read the data at the rx end.
@@ -538,65 +496,14 @@ impl<T> Receiver<T> {
         if self.inner
             .rx
             .compare_exchange_weak(rx, rx.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
-            .is_ok() {
-            Ok(Some(value))
-        } else {
+            .is_err()
+        {
             // We didn't receive this value, forget it.
             mem::forget(value);
-            Err(RecvError::Retry)
+            return TryRecv::Retry;
         }
-    }
 
-    /// Receives an element from the rx end of its circular buffer.
-    ///
-    /// It returns `Some(v)` if a value `v` is received, and `None` if the circular buffer is empty.
-    ///
-    /// This method will not attempt to resize the internal array.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_circbuf::base::{CircBuf, RecvError};
-    ///
-    /// let cb = CircBuf::new();
-    /// let r = cb.receiver();
-    /// cb.send(1);
-    /// cb.send(2);
-    ///
-    /// assert_eq!(r.recv(), Some(1));
-    /// assert_eq!(r.recv(), Some(2));
-    /// ```
-    pub fn recv(&self) -> Option<T> {
-        // Load rx and tx.
-        let mut rx = self.inner.rx.load(Ordering::Relaxed);
-        let tx = self.inner.tx.load(Ordering::Acquire);
-
-        let guard = &epoch::pin();
-
-        loop {
-            // Is the circular buffer empty?
-            if tx.wrapping_sub(rx) <= 0 {
-                return None;
-            }
-
-            // Load array and read the data at the rx end.
-            let array = self.inner.array.load(Ordering::Acquire, guard);
-            let value = unsafe { array.deref().read(rx) };
-
-            // Try incrementing rx to receive the value.
-            match self.inner.rx.compare_exchange_weak(rx, rx.wrapping_add(1), Ordering::Release, Ordering::Relaxed) {
-                Err(rx_cur) => {
-                    // We didn't receive this value, forget it.
-                    mem::forget(value);
-
-                    rx = rx_cur;
-                    thread::yield_now();
-                }
-                Ok(_) => {
-                    return Some(value);
-                }
-            }
-        }
+        TryRecv::Data(value)
     }
 
     /// Receives an element from the rx end of its circular buffer.
@@ -616,7 +523,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, RecvError};
+    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
     ///
     /// let cb = CircBuf::new();
     /// let r = cb.receiver();
@@ -628,7 +535,7 @@ impl<T> Receiver<T> {
     /// assert_eq!(stolen, Some(1));
     /// ```
     ///
-    /// [`RecvError::Retry`]: enum.RecvError.html#variant.Retry
+    /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     /// [`CircBuf::try_recv`]: struct.CircBuf.html#method.try_recv
     /// [`Receiver::try_recv`]: struct.Receiver.html#method.try_recv
     /// [`recv_exclusive`]: struct.Receiver.html#method.recv_exclusive
@@ -683,13 +590,14 @@ mod tests {
     use epoch;
     use self::rand::Rng;
 
-    use super::{CircBuf, RecvError};
+    use super::{CircBuf, TryRecv};
 
-    fn retry<T, F: Fn() -> Result<T, RecvError>>(f: F) -> T {
+    fn retry<T, F: Fn() -> TryRecv<T>>(f: F) -> Option<T> {
         loop {
             match f() {
-                Ok(r) => break r,
-                Err(RecvError::Retry) => {}
+                TryRecv::Data(r) => return Some(r),
+                TryRecv::Empty => return None,
+                TryRecv::Retry => {}
             }
         }
     }
@@ -708,17 +616,17 @@ mod tests {
         assert_eq!(retry(|| r.try_recv()), None);
 
         cb.send(2);
-        assert_eq!(r.recv(), Some(2));
-        assert_eq!(r.recv(), None);
-        assert_eq!(cb.recv(), None);
+        assert_eq!(retry(|| r.try_recv()), Some(2));
+        assert_eq!(retry(|| r.try_recv()), None);
+        assert_eq!(retry(|| cb.try_recv()), None);
 
         cb.send(3);
         cb.send(4);
         cb.send(5);
-        assert_eq!(cb.recv(), Some(3));
-        assert_eq!(r.recv(), Some(4));
-        assert_eq!(cb.recv(), Some(5));
-        assert_eq!(cb.recv(), None);
+        assert_eq!(retry(|| cb.try_recv()), Some(3));
+        assert_eq!(retry(|| r.try_recv()), Some(4));
+        assert_eq!(retry(|| cb.try_recv()), Some(5));
+        assert_eq!(retry(|| cb.try_recv()), None);
     }
 
     #[test]
@@ -730,7 +638,7 @@ mod tests {
         let t = thread::spawn(move || {
             for i in 0..STEPS {
                 loop {
-                    if let Ok(Some(v)) = r.try_recv() {
+                    if let TryRecv::Data(v) = r.try_recv() {
                         assert_eq!(i, v);
                         break;
                     }
@@ -763,7 +671,7 @@ mod tests {
                 thread::spawn(move || {
                     let mut last = 0;
                     while remaining.load(SeqCst) > 0 {
-                        if let Ok(Some(x)) = r.try_recv() {
+                        if let TryRecv::Data(x) = r.try_recv() {
                             assert!(last < *x);
                             last = *x;
                             remaining.fetch_sub(1, SeqCst);
@@ -774,7 +682,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         while remaining.load(SeqCst) > 0 {
-            if let Ok(Some(_)) = cb.try_recv() {
+            if let TryRecv::Data(_) = cb.try_recv() {
                 remaining.fetch_sub(1, SeqCst);
             }
         }
@@ -799,7 +707,7 @@ mod tests {
 
                 thread::spawn(move || {
                     while !done.load(SeqCst) {
-                        if r.recv().is_some() {
+                        if let TryRecv::Data(_) = r.try_recv() {
                             hits.fetch_add(1, SeqCst);
                         }
                     }
@@ -811,7 +719,7 @@ mod tests {
         let mut expected = 0;
         while expected < COUNT {
             if rng.gen_range(0, 3) == 0 {
-                if cb.recv().is_some() {
+                if let TryRecv::Data(_) = cb.try_recv() {
                     hits.fetch_add(1, SeqCst);
                 }
             } else {
@@ -821,7 +729,7 @@ mod tests {
         }
 
         while hits.load(SeqCst) < COUNT {
-            if cb.recv().is_some() {
+            if let TryRecv::Data(_) = cb.try_recv() {
                 hits.fetch_add(1, SeqCst);
             }
         }
@@ -860,7 +768,7 @@ mod tests {
                     let hits = hits.clone();
                     thread::spawn(move || {
                         while !done.load(SeqCst) {
-                            if let Ok(Some(_)) = r.try_recv() {
+                            if let TryRecv::Data(_) = r.try_recv() {
                                 hits.fetch_add(1, SeqCst);
                             }
                         }
@@ -876,7 +784,7 @@ mod tests {
         loop {
             for i in 0..rng.gen_range(0, COUNT) {
                 if rng.gen_range(0, 3) == 0 && my_hits == 0 {
-                    if let Ok(Some(_)) = cb.try_recv() {
+                    if let TryRecv::Data(_) = cb.try_recv() {
                         my_hits += 1;
                     }
                 } else {
@@ -922,7 +830,7 @@ mod tests {
 
                 thread::spawn(move || {
                     for _ in 0..1000 {
-                        if let Ok(Some(_)) = r.try_recv() {
+                        if let TryRecv::Data(_) = r.try_recv() {
                             remaining.fetch_sub(1, SeqCst);
                         }
                     }
@@ -931,7 +839,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for _ in 0..1000 {
-            if let Ok(Some(_)) = cb.try_recv() {
+            if let TryRecv::Data(_) = cb.try_recv() {
                 remaining.fetch_sub(1, SeqCst);
             }
         }

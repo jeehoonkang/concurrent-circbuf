@@ -3,7 +3,7 @@
 //! # Examples
 //!
 //! ```
-//! use concurrent_circbuf::spmc::{Channel, Receiver};
+//! use concurrent_circbuf::spmc::{Channel, Receiver, TryRecv};
 //! use std::thread;
 //!
 //! let c = Channel::<char>::new();
@@ -13,16 +13,17 @@
 //! c.send('b');
 //! c.send('c');
 //!
-//! assert_eq!(c.recv(), Some('a'));
+//! assert_ne!(c.try_recv(), TryRecv::Empty);
 //! drop(c);
 //!
 //! thread::spawn(move || {
-//!     assert_eq!(r.recv(), Some('b'));
-//!     assert_ne!(r.try_recv(), Ok(None)); // Ok(Some('c')) or Err(RecvError::Retry)
+//!     assert_ne!(r.try_recv(), TryRecv::Empty);
+//!     assert_ne!(r.try_recv(), TryRecv::Empty); // Ok(Some('c')) or Err(RecvError::Retry)
 //! }).join().unwrap();
 //! ```
 
-use base::{self, RecvError};
+use base;
+pub use base::TryRecv;
 
 /// An SPMC channel.
 #[derive(Debug)]
@@ -79,7 +80,7 @@ impl<T> Channel<T> {
 
     /// Receives an element from the channel.
     ///
-    /// It returns `Ok(Some(v))` if a value `v` is received, and `Ok(None)` if the channel is
+    /// It returns `Ok(Some(v))` if a value `v` is received, and `TryRecv::Empty` if the channel is
     /// empty. Unlike most methods in concurrent data structures, if another operation gets in the
     /// way while attempting to receive data, this method will bail out immediately with
     /// [`RecvError::Retry`] instead of retrying.
@@ -87,39 +88,19 @@ impl<T> Channel<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::spmc::{Channel, Receiver};
+    /// use concurrent_circbuf::spmc::{Channel, Receiver, TryRecv};
     ///
     /// let c = Channel::<u32>::new();
     /// c.send(1);
     /// c.send(2);
     ///
-    /// assert_ne!(c.try_recv(), Ok(None));
-    /// assert_ne!(c.try_recv(), Ok(None));
+    /// assert_ne!(c.try_recv(), TryRecv::Empty);
+    /// assert_ne!(c.try_recv(), TryRecv::Empty);
     /// ```
     ///
     /// [`RecvError::Retry`]: enum.RecvError.html#variant.Retry
-    pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
+    pub fn try_recv(&self) -> TryRecv<T> {
         self.0.try_recv()
-    }
-
-    /// Receives an element from the channel.
-    ///
-    /// It returns `Some(v)` if a value `v` is received, and `None` if the circular buffer is empty.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_circbuf::spmc::{Channel, Receiver};
-    ///
-    /// let c = Channel::<u32>::new();
-    /// c.send(1);
-    /// c.send(2);
-    ///
-    /// assert_eq!(c.recv(), Some(1));
-    /// assert_eq!(c.recv(), Some(2));
-    /// ```
-    pub fn recv(&self) -> Option<T> {
-        self.0.recv()
     }
 
     /// Creates a receiver for the channel.
@@ -140,7 +121,7 @@ impl<T> Channel<T> {
 impl<T> Receiver<T> {
     /// Receives an element from the channel.
     ///
-    /// It returns `Ok(Some(v))` if a value `v` is received, and `Ok(None)` if the channel is
+    /// It returns `Ok(Some(v))` if a value `v` is received, and `TryRecv::Empty` if the channel is
     /// empty. Unlike most methods in concurrent data structures, if another operation gets in the
     /// way while attempting to receive data, this method will bail out immediately with
     /// [`RecvError::Retry`] instead of retrying.
@@ -148,41 +129,20 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::spmc::{Channel, Receiver};
+    /// use concurrent_circbuf::spmc::{Channel, Receiver, TryRecv};
     ///
     /// let c = Channel::<u32>::new();
     /// c.send(1);
     /// c.send(2);
     ///
     /// let r = c.receiver();
-    /// assert_ne!(r.try_recv(), Ok(None));
-    /// assert_ne!(r.try_recv(), Ok(None));
+    /// assert_ne!(r.try_recv(), TryRecv::Empty);
+    /// assert_ne!(r.try_recv(), TryRecv::Empty);
     /// ```
     ///
     /// [`RecvError::Retry`]: enum.RecvError.html#variant.Retry
-    pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
+    pub fn try_recv(&self) -> TryRecv<T> {
         self.0.try_recv()
-    }
-
-    /// Receives an element from the channel.
-    ///
-    /// It returns `Some(v)` if a value `v` is received, and `None` if the circular buffer is empty.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use concurrent_circbuf::spmc::{Channel, Receiver};
-    ///
-    /// let c = Channel::<u32>::new();
-    /// c.send(1);
-    /// c.send(2);
-    ///
-    /// let r = c.receiver();
-    /// assert_eq!(r.recv(), Some(1));
-    /// assert_eq!(r.recv(), Some(2));
-    /// ```
-    pub fn recv(&self) -> Option<T> {
-        self.0.recv()
     }
 }
 
