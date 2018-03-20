@@ -13,12 +13,12 @@
 //! c.send('b');
 //! c.send('c');
 //!
-//! assert_ne!(c.try_recv(), TryRecv::Empty);
+//! assert_ne!(c.try_recv(), TryRecv::Empty); // TryRecv::Data('a') or TryRecv::Retry
 //! drop(c);
 //!
 //! thread::spawn(move || {
 //!     assert_ne!(r.try_recv(), TryRecv::Empty);
-//!     assert_ne!(r.try_recv(), TryRecv::Empty); // Ok(Some('c')) or Err(RecvError::Retry)
+//!     assert_ne!(r.try_recv(), TryRecv::Empty);
 //! }).join().unwrap();
 //! ```
 
@@ -80,10 +80,10 @@ impl<T> Channel<T> {
 
     /// Receives an element from the channel.
     ///
-    /// It returns `Ok(Some(v))` if a value `v` is received, and `TryRecv::Empty` if the channel is
-    /// empty. Unlike most methods in concurrent data structures, if another operation gets in the
-    /// way while attempting to receive data, this method will bail out immediately with
-    /// [`RecvError::Retry`] instead of retrying.
+    /// It returns [`TryRecv::Data`] if a value is received, and [`TryRecv::Empty`] if the channel
+    /// is empty. Unlike most methods in concurrent data structures, if another operation gets in
+    /// the way while attempting to receive data, this method will bail out immediately with
+    /// [`TryRecv::Retry`] instead of retrying.
     ///
     /// # Examples
     ///
@@ -98,7 +98,9 @@ impl<T> Channel<T> {
     /// assert_ne!(c.try_recv(), TryRecv::Empty);
     /// ```
     ///
-    /// [`RecvError::Retry`]: enum.RecvError.html#variant.Retry
+    /// [`TryRecv::Data`]: enum.TryRecv.html#variant.Data
+    /// [`TryRecv::Empty`]: enum.TryRecv.html#variant.Empty
+    /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     pub fn try_recv(&self) -> TryRecv<T> {
         self.0.try_recv()
     }
@@ -121,10 +123,10 @@ impl<T> Channel<T> {
 impl<T> Receiver<T> {
     /// Receives an element from the channel.
     ///
-    /// It returns `Ok(Some(v))` if a value `v` is received, and `TryRecv::Empty` if the channel is
-    /// empty. Unlike most methods in concurrent data structures, if another operation gets in the
-    /// way while attempting to receive data, this method will bail out immediately with
-    /// [`RecvError::Retry`] instead of retrying.
+    /// It returns [`TryRecv::Data`] if a value is received, and [`TryRecv::Empty`] if the channel
+    /// is empty. Unlike most methods in concurrent data structures, if another operation gets in
+    /// the way while attempting to receive data, this method will bail out immediately with
+    /// [`TryRecv::Retry`] instead of retrying.
     ///
     /// # Examples
     ///
@@ -140,7 +142,9 @@ impl<T> Receiver<T> {
     /// assert_ne!(r.try_recv(), TryRecv::Empty);
     /// ```
     ///
-    /// [`RecvError::Retry`]: enum.RecvError.html#variant.Retry
+    /// [`TryRecv::Data`]: enum.TryRecv.html#variant.Data
+    /// [`TryRecv::Empty`]: enum.TryRecv.html#variant.Empty
+    /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     pub fn try_recv(&self) -> TryRecv<T> {
         self.0.try_recv()
     }

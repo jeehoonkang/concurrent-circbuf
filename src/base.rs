@@ -63,10 +63,22 @@ const DEFAULT_MIN_CAP: usize = 16;
 /// deallocated as soon as possible.
 const FLUSH_THRESHOLD_BYTES: usize = 1 << 10;
 
+#[repr(C)]
+struct CPair<T, U> {
+    pub first: T,
+    pub second: U,
+}
+
+impl<T, U> CPair<T, U> {
+    pub fn new(first: T, second: U) -> Self {
+        Self { first, second }
+    }
+}
+
 /// An array that holds elements in a circular buffer.
 struct Array<T> {
     /// Pointer to the allocated memory.
-    ptr: *mut T,
+    ptr: *mut CPair<isize, T>,
 
     /// Capacity of the array. Always a power of two.
     cap: usize,
@@ -80,26 +92,40 @@ impl<T> Array<T> {
         debug_assert_eq!(cap, cap.next_power_of_two());
 
         let mut v = Vec::with_capacity(cap);
-        let ptr = v.as_mut_ptr();
+        let ptr: *mut CPair<isize, T> = v.as_mut_ptr();
         mem::forget(v);
+
+        unsafe {
+            for i in 0..cap {
+                ptr::write(
+                    ptr.offset(i as isize),
+                    CPair::new(i as isize + 1, mem::uninitialized()),
+                );
+            }
+        }
 
         Array { ptr, cap }
     }
 
     /// Returns a pointer to the element at the specified `index`.
-    unsafe fn at(&self, index: isize) -> *mut T {
+    unsafe fn at(&self, index: isize) -> *mut CPair<isize, T> {
         // `self.cap` is always a power of two.
         self.ptr.offset(index & (self.cap - 1) as isize)
     }
 
     /// Writes `value` into the specified `index`.
     unsafe fn write(&self, index: isize, value: T) {
-        ptr::write(self.at(index), value)
+        ptr::write(self.at(index), CPair::new(index, value))
     }
 
     /// Reads a value from the specified `index`.
-    unsafe fn read(&self, index: isize) -> T {
-        ptr::read(self.at(index))
+    unsafe fn read(&self, index: isize) -> Option<T> {
+        let ptr = self.at(index) as *const u8;
+        let i = ptr::read(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const isize);
+        if index != i {
+            return None;
+        }
+        Some(ptr::read(ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as *const T))
     }
 }
 
@@ -255,7 +281,8 @@ unsafe impl<T: Send> Send for CircBuf<T> {}
 impl<T> CircBuf<T> {
     /// Returns a new circular buffer.
     ///
-    /// The internal array is destructed as soon as the circular buffer and all its receivers get dropped.
+    /// The internal array is destructed as soon as the circular buffer and all its receivers get
+    /// dropped.
     ///
     /// # Examples
     ///
@@ -308,7 +335,10 @@ impl<T> CircBuf<T> {
         unsafe {
             // Load rx, tx, and array. The array doesn't have to be epoch-protected because the
             // current thread (the worker) is the only one that grows and shrinks it.
-            let mut array = self.inner.array.load(Ordering::Relaxed, epoch::unprotected());
+            let mut array = self.inner.array.load(
+                Ordering::Relaxed,
+                epoch::unprotected(),
+            );
             let tx = self.inner.tx.load(Ordering::Relaxed);
             let rx = self.inner.rx.load(Ordering::Acquire);
 
@@ -319,7 +349,10 @@ impl<T> CircBuf<T> {
             // If the circular buffer is full, grow the underlying array.
             if len >= cap as isize {
                 self.inner.resize(2 * cap);
-                array = self.inner.array.load(Ordering::Relaxed, epoch::unprotected());
+                array = self.inner.array.load(
+                    Ordering::Relaxed,
+                    epoch::unprotected(),
+                );
             }
 
             // Write `value` into the right slot and increment `tx`.
@@ -330,10 +363,10 @@ impl<T> CircBuf<T> {
 
     /// Receives an element from the rx end of the circular buffer.
     ///
-    /// It returns `TryRecv::Data(v)` if a value `v` is received, and `TryRecv::Empty` if the circular buffer
-    /// is empty. Unlike most methods in concurrent data structures, if another operation gets in
-    /// the way while attempting to receive data, this method will bail out immediately with
-    /// [`TryRecv::Retry`] instead of retrying.
+    /// It returns `TryRecv::Data(v)` if a value `v` is received, and `TryRecv::Empty` if the
+    /// circular buffer is empty. Unlike most methods in concurrent data structures, if another
+    /// operation gets in the way while attempting to receive data, this method will bail out
+    /// immediately with [`TryRecv::Retry`] instead of retrying.
     ///
     /// If the internal array is less than a quarter full, a new array half the capacity of the
     /// current one will be allocated.
@@ -355,6 +388,7 @@ impl<T> CircBuf<T> {
     ///
     /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     pub fn try_recv(&self) -> TryRecv<T> {
+        // Load tx and rx.
         let tx = self.inner.tx.load(Ordering::Relaxed);
         let rx = self.inner.rx.load(Ordering::Relaxed);
         let len = tx.wrapping_sub(rx);
@@ -373,12 +407,18 @@ impl<T> CircBuf<T> {
             return TryRecv::Retry;
         }
 
+        // Load the value at the rx end of the array.
         unsafe {
-            let buf = self.inner.array.load(Ordering::Relaxed, epoch::unprotected());
-            let value = buf.deref().read(rx);
+            let array = self.inner.array.load(
+                Ordering::Relaxed,
+                epoch::unprotected(),
+            );
+
+            // Because len > 0, we should read a valid value.
+            let value = array.deref().read(rx).unwrap();
 
             // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
-            let cap = buf.deref().cap;
+            let cap = array.deref().cap;
             if cap > self.inner.min_cap && len <= cap as isize / 4 {
                 self.inner.resize(cap / 2);
             }
@@ -476,20 +516,17 @@ impl<T> Receiver<T> {
     ///
     /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
     pub fn try_recv(&self) -> TryRecv<T> {
-        // Load rx and tx.
+        // Load rx.
         let rx = self.inner.rx.load(Ordering::Relaxed);
-        let tx = self.inner.tx.load(Ordering::Acquire);
 
-        // Is the circular buffer empty?
-        if tx.wrapping_sub(rx) <= 0 {
-            return TryRecv::Empty;
-        }
-
-        // Load array and read the data at the rx end.
+        // Load the value at the rx end of the array.
         let value = {
             let guard = &epoch::pin();
             let array = self.inner.array.load(Ordering::Acquire, guard);
-            unsafe { array.deref().read(rx) }
+            match unsafe { array.deref().read(rx) } {
+                None => return TryRecv::Empty,
+                Some(value) => value,
+            }
         };
 
         // Try incrementing rx to receive the value.
@@ -540,20 +577,17 @@ impl<T> Receiver<T> {
     /// [`Receiver::try_recv`]: struct.Receiver.html#method.try_recv
     /// [`recv_exclusive`]: struct.Receiver.html#method.recv_exclusive
     pub unsafe fn recv_exclusive(&self) -> Option<T> {
-        // Load rx and tx.
+        // Load rx.
         let rx = self.inner.rx.load(Ordering::Relaxed);
-        let tx = self.inner.tx.load(Ordering::Acquire);
 
-        // Is the circular buffer empty?
-        if tx.wrapping_sub(rx) <= 0 {
-            return None;
-        }
-
-        // Load array and read the data at the rx end.
+        // Load the value at the rx end of the array.
         let value = {
             let guard = &epoch::pin();
-            let buf = self.inner.array.load(Ordering::Acquire, guard);
-            buf.deref().read(rx)
+            let array = self.inner.array.load(Ordering::Acquire, guard);
+            match array.deref().read(rx) {
+                None => return None,
+                Some(value) => value,
+            }
         };
 
         // Increment rx to receive the value.
@@ -635,13 +669,11 @@ mod tests {
 
         let cb = CircBuf::new();
         let r = cb.receiver();
-        let t = thread::spawn(move || {
-            for i in 0..STEPS {
-                loop {
-                    if let TryRecv::Data(v) = r.try_recv() {
-                        assert_eq!(i, v);
-                        break;
-                    }
+        let t = thread::spawn(move || for i in 0..STEPS {
+            loop {
+                if let TryRecv::Data(v) = r.try_recv() {
+                    assert_eq!(i, v);
+                    break;
                 }
             }
         });
@@ -705,11 +737,9 @@ mod tests {
                 let done = done.clone();
                 let hits = hits.clone();
 
-                thread::spawn(move || {
-                    while !done.load(SeqCst) {
-                        if let TryRecv::Data(_) = r.try_recv() {
-                            hits.fetch_add(1, SeqCst);
-                        }
+                thread::spawn(move || while !done.load(SeqCst) {
+                    if let TryRecv::Data(_) = r.try_recv() {
+                        hits.fetch_add(1, SeqCst);
                     }
                 })
             })
@@ -766,11 +796,9 @@ mod tests {
 
                 let t = {
                     let hits = hits.clone();
-                    thread::spawn(move || {
-                        while !done.load(SeqCst) {
-                            if let TryRecv::Data(_) = r.try_recv() {
-                                hits.fetch_add(1, SeqCst);
-                            }
+                    thread::spawn(move || while !done.load(SeqCst) {
+                        if let TryRecv::Data(_) = r.try_recv() {
+                            hits.fetch_add(1, SeqCst);
                         }
                     })
                 };
@@ -828,11 +856,9 @@ mod tests {
                 let r = cb.receiver();
                 let remaining = remaining.clone();
 
-                thread::spawn(move || {
-                    for _ in 0..1000 {
-                        if let TryRecv::Data(_) = r.try_recv() {
-                            remaining.fetch_sub(1, SeqCst);
-                        }
+                thread::spawn(move || for _ in 0..1000 {
+                    if let TryRecv::Data(_) = r.try_recv() {
+                        remaining.fetch_sub(1, SeqCst);
                     }
                 })
             })

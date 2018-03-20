@@ -51,7 +51,10 @@ pub fn new<T>() -> (Sender<T>, Receiver<T>) {
     let circbuf = base::CircBuf::new();
     let receiver = circbuf.receiver();
     let sender = Sender { 0: circbuf };
-    let receiver = Receiver { receiver: receiver, _marker: PhantomData };
+    let receiver = Receiver {
+        receiver: receiver,
+        _marker: PhantomData,
+    };
     (sender, receiver)
 }
 
@@ -72,7 +75,10 @@ pub fn with_min_capacity<T>(min_cap: usize) -> (Sender<T>, Receiver<T>) {
     let circbuf = base::CircBuf::with_min_capacity(min_cap);
     let receiver = circbuf.receiver();
     let sender = Sender { 0: circbuf };
-    let receiver = Receiver { receiver: receiver, _marker: PhantomData };
+    let receiver = Receiver {
+        receiver: receiver,
+        _marker: PhantomData,
+    };
     (sender, receiver)
 }
 

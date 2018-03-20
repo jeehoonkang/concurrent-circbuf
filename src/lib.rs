@@ -4,6 +4,8 @@
 
 extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils as utils;
+#[macro_use]
+extern crate memoffset;
 
 pub mod base;
 pub use base::TryRecv;
