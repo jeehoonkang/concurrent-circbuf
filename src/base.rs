@@ -45,6 +45,7 @@
 //! [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
 //! [Receiver::try_recv]: struct.Receiver.html#method.try_recv
 
+use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -164,10 +165,10 @@ pub enum TryRecv<T> {
 /// Internal data that is shared among a circular buffer and its receivers.
 struct Inner<T> {
     /// The rx index.
-    rx: AtomicIsize,
+    rx: CachePadded<AtomicIsize>,
 
     /// The tx index.
-    tx: AtomicIsize,
+    tx: CachePadded<AtomicIsize>,
 
     /// The underlying array.
     array: Atomic<Array<T>>,
@@ -177,18 +178,13 @@ struct Inner<T> {
 }
 
 impl<T> Inner<T> {
-    /// Returns a new `Inner` with default minimum capacity.
-    fn new() -> Self {
-        Self::with_min_capacity(DEFAULT_MIN_CAP)
-    }
-
     /// Returns a new `Inner` with minimum capacity of `min_cap` rounded to the next power of two.
-    fn with_min_capacity(min_cap: usize) -> Self {
+    fn new(min_cap: usize) -> Self {
         let power = min_cap.next_power_of_two();
         assert!(power >= min_cap, "capacity too large: {}", min_cap);
         Inner {
-            rx: AtomicIsize::new(0),
-            tx: AtomicIsize::new(0),
+            rx: CachePadded::new(AtomicIsize::new(0)),
+            tx: CachePadded::new(AtomicIsize::new(0)),
             array: Atomic::new(Array::new(power)),
             min_cap: power,
         }
@@ -282,7 +278,8 @@ impl<T> Drop for Inner<T> {
 /// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
 /// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
 pub struct CircBuf<T> {
-    inner: Arc<CachePadded<Inner<T>>>,
+    inner: Arc<Inner<T>>,
+    rx_lb: Cell<isize>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
 
@@ -302,10 +299,7 @@ impl<T> CircBuf<T> {
     /// let cb = CircBuf::<i32>::new();
     /// ```
     pub fn new() -> CircBuf<T> {
-        CircBuf {
-            inner: Arc::new(CachePadded::new(Inner::new())),
-            _marker: PhantomData,
-        }
+        Self::with_min_capacity(DEFAULT_MIN_CAP)
     }
 
     /// Returns a new circular buffer with the specified minimum capacity.
@@ -322,7 +316,8 @@ impl<T> CircBuf<T> {
     /// ```
     pub fn with_min_capacity(min_cap: usize) -> CircBuf<T> {
         CircBuf {
-            inner: Arc::new(CachePadded::new(Inner::with_min_capacity(min_cap))),
+            inner: Arc::new(Inner::new(min_cap)),
+            rx_lb: Cell::new(0),
             _marker: PhantomData,
         }
     }
@@ -350,19 +345,26 @@ impl<T> CircBuf<T> {
                 epoch::unprotected(),
             );
             let tx = self.inner.tx.load(Ordering::Relaxed);
-            let rx = self.inner.rx.load(Ordering::Acquire);
+            let rx_lb = self.rx_lb.get();
 
             // Calculate the length and the capacity of the circular buffer.
-            let len = tx.wrapping_sub(rx);
+            let len = tx.wrapping_sub(rx_lb);
             let cap = array.deref().cap;
 
             // If the circular buffer is full, grow the underlying array.
             if len >= cap as isize {
-                self.inner.resize(2 * cap);
-                array = self.inner.array.load(
-                    Ordering::Relaxed,
-                    epoch::unprotected(),
-                );
+                let rx = self.inner.rx.load(Ordering::Acquire);
+                self.rx_lb.set(rx);
+                let len = tx.wrapping_sub(rx);
+                let cap = array.deref().cap;
+
+                if len >= cap as isize {
+                    self.inner.resize(2 * cap);
+                    array = self.inner.array.load(
+                        Ordering::Relaxed,
+                        epoch::unprotected(),
+                    );
+                }
             }
 
             // Write `value` into the right slot and increment `tx`.
@@ -486,7 +488,7 @@ impl<T> Default for CircBuf<T> {
 /// [`try_recv`]: struct.Receiver.html#method.try_recv
 /// [`recv_exclusive`]: struct.Receiver.html#method.recv_exclusive
 pub struct Receiver<T> {
-    inner: Arc<CachePadded<Inner<T>>>,
+    inner: Arc<Inner<T>>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
 
