@@ -1,6 +1,6 @@
 //! Bounded and unbounded, SPSC and SPMC channels based on concurrent circular buffer.
 
-#![deny(missing_docs, warnings, missing_debug_implementations)]
+#![warn(missing_docs, missing_debug_implementations)]
 
 extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils as utils;

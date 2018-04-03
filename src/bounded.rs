@@ -23,7 +23,6 @@
 /// }).join().unwrap();
 /// ```
 pub mod spsc {
-    use std::marker::PhantomData;
     use base;
 
     /// The sender of a bounded SPSC channel.
@@ -32,10 +31,7 @@ pub mod spsc {
 
     /// The receiver of a bounded SPSC channel.
     #[derive(Debug)]
-    pub struct Receiver<T> {
-        receiver: base::Receiver<T>,
-        _marker: PhantomData<*mut ()>, // !Send + !Sync
-    }
+    pub struct Receiver<T>(base::Receiver<T>);
 
     unsafe impl<T> Send for Receiver<T> {}
 
@@ -55,10 +51,7 @@ pub mod spsc {
         let circbuf = base::CircBuf::new(cap);
         let receiver = circbuf.receiver();
         let sender = Sender { 0: circbuf };
-        let receiver = Receiver {
-            receiver: receiver,
-            _marker: PhantomData,
-        };
+        let receiver = Receiver { 0: receiver };
         (sender, receiver)
     }
 
@@ -96,7 +89,7 @@ pub mod spsc {
         pub fn recv(&self) -> Option<T> {
             // It is safe to call `recv_exclusive()`, because `Sender` doesn't receive at all, and I'm
             // the only receiver and `Receiver` is not `Sync`.
-            unsafe { self.receiver.recv_exclusive() }
+            unsafe { self.0.recv_exclusive() }
         }
     }
 }
@@ -243,6 +236,34 @@ pub mod spmc {
         /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
         pub fn try_recv(&self) -> TryRecv<T> {
             self.0.try_recv()
+        }
+
+        /// Receives half the elements from the channel.
+        ///
+        /// It returns [`TryRecv::Data`] if values are received, and [`TryRecv::Empty`] if the
+        /// channel is empty. Unlike most methods in concurrent data structures, if another
+        /// operation gets in the way while attempting to receive data, this method will bail out
+        /// immediately with [`TryRecv::Retry`] instead of retrying.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use concurrent_circbuf::bounded::spmc::{Channel, Receiver, TryRecv};
+        ///
+        /// let c = Channel::<u32>::new(16);
+        /// c.send(1).unwrap();
+        /// c.send(2).unwrap();
+        ///
+        /// let r = c.receiver();
+        /// assert_eq!(r.try_recv_half(), TryRecv::Data(vec![1]));
+        /// assert_eq!(r.try_recv_half(), TryRecv::Data(vec![2]));
+        /// ```
+        ///
+        /// [`TryRecv::Data`]: enum.TryRecv.html#variant.Data
+        /// [`TryRecv::Empty`]: enum.TryRecv.html#variant.Empty
+        /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
+        pub fn try_recv_half(&self) -> TryRecv<Vec<T>> {
+            self.0.try_recv_half()
         }
     }
 

@@ -767,7 +767,7 @@ impl<T> Receiver<T> {
         // Try incrementing rx to receive the value.
         if self.inner
             .rx
-            .compare_exchange_weak(rx, rx.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
+            .compare_exchange(rx, rx.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
             .is_err()
         {
             // We didn't receive this value, forget it.
@@ -776,6 +776,87 @@ impl<T> Receiver<T> {
         }
 
         TryRecv::Data(value)
+    }
+
+    /// Receives half the elements from the rx end of its circular buffer.
+    ///
+    /// It returns `TryRecv::Data(vs)` if values `v` are received, and `TryRecv::Empty` if the
+    /// circular buffer is empty. Unlike most methods in concurrent data structures, if another
+    /// operation gets in the way while attempting to receive data, this method will bail out
+    /// immediately with [`TryRecv::Retry`] instead of retrying.
+    ///
+    /// This method will not attempt to resize the internal array.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    ///
+    /// let cb = DynamicCircBuf::new();
+    /// let r = cb.receiver();
+    /// cb.send(1);
+    /// cb.send(2);
+    ///
+    /// // Attempt to receive an element, but keep retrying if we get `Retry`.
+    /// let stolen = loop {
+    ///     match r.try_recv_half() {
+    ///         TryRecv::Data(r) => break Some(r),
+    ///         TryRecv::Empty => break None,
+    ///         TryRecv::Retry => {}
+    ///     }
+    /// };
+    /// assert_eq!(stolen, Some(vec![1]));
+    /// ```
+    ///
+    /// [`TryRecv::Retry`]: enum.TryRecv.html#variant.Retry
+    pub fn try_recv_half(&self) -> TryRecv<Vec<T>> {
+        // Load rx and tx, and calculate the length of the array.
+        let rx = self.inner.rx.load(Ordering::Relaxed);
+        let tx = self.inner.tx.load(Ordering::Acquire);
+        let len = tx.wrapping_sub(rx);
+
+        if len <= 0 {
+            return TryRecv::Empty;
+        }
+
+        // Calculate the number of elements to receive.
+        let num = (len + 1) / 2;
+
+        // Load the values at [rx, rx + max).
+        let values = {
+            let mut values: Vec<T> = Vec::with_capacity(num as usize);
+            let guard = &epoch::pin();
+            let array = unsafe { self.inner.array.load_consume(guard).deref() };
+            for i in 0..num {
+                match unsafe { array.read(rx.wrapping_add(i)) } {
+                    Some(v) => values.push(v),
+                    None => {
+                        // `None` means the buffer is already wrapped around, because we already
+                        // acknowledged the values in the range [rx, tx) thanks to release/acquire
+                        // synchronization via `tx`.
+                        return TryRecv::Retry;
+                    }
+                }
+            }
+            values
+        };
+
+        if values.is_empty() {
+            return TryRecv::Empty;
+        }
+
+        // Try incrementing rx to receive the values.
+        if self.inner
+            .rx
+            .compare_exchange(rx, rx.wrapping_add(num), Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            // We didn't receive this value, forget it.
+            mem::forget(values);
+            return TryRecv::Retry;
+        }
+
+        TryRecv::Data(values)
     }
 
     /// Receives an element from the rx end of its circular buffer.
@@ -913,6 +994,32 @@ mod tests {
                         assert_eq!(i, v);
                         break;
                     }
+                }
+            }
+        });
+
+        for i in 0..STEPS {
+            cb.send(i);
+        }
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn try_recv_half_send() {
+        const STEPS: usize = 50_000;
+
+        let cb = DynamicCircBuf::new();
+        let r = cb.receiver();
+        let t = thread::spawn(move || {
+            let mut i = 0;
+            loop {
+                if let TryRecv::Data(v) = r.try_recv_half() {
+                    for j in v {
+                        assert_eq!(i, j);
+                        i += 1;
+                    }
+
+                    if i == STEPS { break; }
                 }
             }
         });
