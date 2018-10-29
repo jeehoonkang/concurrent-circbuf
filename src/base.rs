@@ -72,6 +72,20 @@ impl<T, U> CPair<T, U> {
     pub fn new(first: T, second: U) -> Self {
         Self { first, second }
     }
+
+    pub fn fst_mut(ptr: *mut Self) -> *mut T {
+        unsafe {
+            let ptr = ptr as *mut u8;
+            ptr.add(offset_of!(Self, first)) as *mut T
+        }
+    }
+
+    pub fn snd_mut(ptr: *mut Self) -> *mut U {
+        unsafe {
+            let ptr = ptr as *mut u8;
+            ptr.add(offset_of!(Self, second)) as *mut U
+        }
+    }
 }
 
 /// An array that holds elements in a circular buffer.
@@ -97,13 +111,13 @@ impl<T> Array<T> {
         let ptr: *mut CPair<AtomicUsize, T> = v.as_mut_ptr();
         mem::forget(v);
 
-        // Mark all entries invalid. Concretely, for each entry at `i`, we put the index `i - 1`,
+        // Mark all entries invalid. Concretely, for each entry at `i`, we put the index `i + 1`,
         // which is invalid. This is because the `i`-th entry can contain only elements with the
         // index `i + N * cap`, where `N` is an integer.
         unsafe {
             for i in 0..cap {
                 ptr::write(
-                    ptr.offset(i as isize),
+                    ptr.add(i),
                     CPair::new(AtomicUsize::new(i + 1), mem::uninitialized()),
                 );
             }
@@ -115,33 +129,28 @@ impl<T> Array<T> {
     /// Returns a pointer to the element at the specified `index`.
     unsafe fn at(&self, index: usize) -> *mut CPair<AtomicUsize, T> {
         // `self.cap` is always a power of two.
-        self.ptr.offset((index & (self.cap - 1)) as isize)
+        self.ptr.add(index & (self.cap - 1))
     }
 
     /// Writes `value` into the specified `index`.
     unsafe fn write(&self, index: usize, value: T) {
-        let ptr = self.at(index) as *const u8;
+        let ptr = self.at(index);
 
         // Write the value.
-        ptr::write(
-            ptr.offset(offset_of!(CPair<usize, T>, second) as isize) as *mut T,
-            value,
-        );
+        ptr::write(CPair::snd_mut(ptr), value);
 
         // Write the index with `Release`.
-        (*(ptr.offset(offset_of!(CPair<usize, T>, first) as isize) as *const AtomicUsize))
-            .store(index, Ordering::Release);
+        (*CPair::fst_mut(ptr)).store(index, Ordering::Release);
     }
 
     /// Reads a value from the specified `index`.
     ///
     /// Returns `Some(v)` if `v` is at `index`, and `None` if there is no valid value for `index`.
     unsafe fn read(&self, index: usize) -> Option<T> {
-        let ptr = self.at(index) as *const u8;
+        let ptr = self.at(index);
 
         // Read the index with `Acquire`.
-        let i = (*(ptr.offset(offset_of!(CPair<usize, T>, first) as isize) as *const AtomicUsize))
-            .load(Ordering::Acquire);
+        let i = (*CPair::fst_mut(ptr)).load(Ordering::Acquire);
 
         // If the index written in the array mismatches with the queried index, there's no valid
         // value.
@@ -150,9 +159,7 @@ impl<T> Array<T> {
         }
 
         // Read the value.
-        Some(ptr::read(
-            ptr.offset(offset_of!(CPair<usize, T>, second) as isize) as *const T,
-        ))
+        Some(ptr::read(CPair::snd_mut(ptr)))
     }
 }
 
@@ -362,16 +369,16 @@ impl<T> CircBuf<T> {
             let rx_lb = self.rx_lb.get();
 
             // Calculate the length and the capacity of the circular buffer.
-            let len = tx.wrapping_sub(rx_lb);
+            let len = tx.wrapping_sub(rx_lb) as isize;
             let cap = array.deref().cap;
 
             // If the circular buffer is full, grow the underlying array.
-            if len >= cap as usize {
+            if len >= cap as isize {
                 let rx = self.inner.rx.load(Ordering::Acquire);
                 self.rx_lb.set(rx);
-                let len = tx.wrapping_sub(rx);
+                let len = tx.wrapping_sub(rx) as isize;
 
-                if len >= cap as usize {
+                if len >= cap as isize {
                     return Err((value, tx, cap));
                 }
             }
@@ -396,7 +403,7 @@ impl<T> CircBuf<T> {
         // Load tx and rx.
         let tx = self.inner.tx.load(Ordering::Relaxed);
         let rx = self.inner.rx.load(Ordering::Relaxed);
-        let len = tx.wrapping_sub(rx);
+        let len = tx.wrapping_sub(rx) as isize;
 
         // Is the circular buffer empty?
         if len <= 0 {
@@ -431,7 +438,7 @@ impl<T> CircBuf<T> {
 
             // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
             let cap = array.deref().cap;
-            let resize = if len <= cap as usize / 4 {
+            let resize = if len <= cap as isize / 4 {
                 Some(cap)
             } else {
                 None
@@ -698,6 +705,12 @@ impl<T> DynamicCircBuf<T> {
     }
 }
 
+impl<T> Default for DynamicCircBuf<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> fmt::Debug for DynamicCircBuf<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "DynamicCircBuf {{ ... }}")
@@ -818,14 +831,14 @@ impl<T> Receiver<T> {
         // Load rx and tx, and calculate the length of the array.
         let rx = self.inner.rx.load(Ordering::Relaxed);
         let tx = self.inner.tx.load(Ordering::Acquire);
-        let len = tx.wrapping_sub(rx);
+        let len = tx.wrapping_sub(rx) as isize;
 
         if len <= 0 {
             return TryRecv::Empty;
         }
 
         // Calculate the number of elements to receive.
-        let num = (len + 1) / 2;
+        let num = ((len + 1) / 2) as usize;
 
         // Load the values at [rx, rx + max).
         let values = {

@@ -241,6 +241,12 @@ pub mod spmc {
         }
     }
 
+    impl<T> Default for Channel<T> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl<T> Receiver<T> {
         /// Receives an element from the channel.
         ///
