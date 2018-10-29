@@ -1,11 +1,10 @@
 //! A concurrent circular buffer.
 //!
 //! [`CircBuf`] is a circular buffer, which is basically a fixed-sized array that has two ends: tx
-//! and rx. A [`CircBuf`] can [`send`] elements into the tx end and [`try_recv`][CircBuf::try_recv]
-//! elements from the rx end. A [`CircBuf`] doesn't implement `Sync` so it cannot be shared among
-//! multiple threads. However, it can create [`Receiver`]s, and those can be easily cloned, shared,
-//! and sent to other threads. [`Receiver`]s can only [`try_recv`][Receiver::try_recv] elements from
-//! the rx end.
+//! and rx. A [`CircBuf`] can [`send`] elements into the tx end and [`CircBuf::try_recv`] elements
+//! from the rx end. A [`CircBuf`] doesn't implement `Sync` so it cannot be shared among multiple
+//! threads. However, it can create [`Receiver`]s, and those can be easily cloned, shared, and sent
+//! to other threads. [`Receiver`]s can only [`Receiver::try_recv`] elements from the rx end.
 //!
 //! Here's a visualization of a [`CircBuf`] of capacity 4, consisting of 2 elements `a` and `b`.
 //!
@@ -32,10 +31,9 @@
 //! other threads.
 //!
 //! Then, all threads are executing in a loop. In the loop, each one attempts to
-//! [`try_recv`][CircBuf::try_recv] some work from its own [`CircBuf`]. But if it is empty, it
-//! attempts to [`try_recv`][Receiver::try_recv] work from some other thread instead. When executing
-//! work (or being idle), a thread may produce more work, which gets [`send`]ed into its
-//! [`CircBuf`].
+//! [`CircBuf::try_recv`] some work from its own [`CircBuf`]. But if it is empty, it attempts to
+//! [`Receiver::try_recv`] work from some other thread instead. When executing work (or being idle),
+//! a thread may produce more work, which gets [`send`]ed into its [`CircBuf`].
 //!
 //! It is worth noting that it is discouraged to use work-stealing deque for fair schedulers,
 //! because its `pop()` may return the work that is just `push()`ed, effectively scheduling the same
@@ -172,11 +170,12 @@ impl<T> Drop for Array<T> {
     }
 }
 
-/// The return type for [CircBuf::try_recv], [DynamicCircBuf::try_recv], and [Receiver::try_recv].
+/// The return type for [`CircBuf::try_recv`], [`DynamicCircBuf::try_recv`], and
+/// [`Receiver::try_recv`].
 ///
-/// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
-/// [DynamicCircBuf::try_recv]: struct.DynamicCircBuf.html#method.try_recv
-/// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
+/// [`CircBuf::try_recv`]: struct.CircBuf.html#method.try_recv
+/// [`DynamicCircBuf::try_recv`]: struct.DynamicCircBuf.html#method.try_recv
+/// [`Receiver::try_recv`]: struct.Receiver.html#method.try_recv
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TryRecv<T> {
     /// `try_recv` received an element.
@@ -248,14 +247,14 @@ impl<T> Drop for Inner<T> {
 /// A fixed-sized concurrent circular buffer.
 ///
 /// A circular buffer has two ends: rx and tx. Elements can be [`send`]ed into the tx end and
-/// [`try_recv`][CircBuf::try_recv]ed from the rx end. The rx end is special in that receivers can
-/// also receive from the rx end using [`try_recv`][Receiver::try_recv] method.
+/// [`CircBuf::try_recv`]ed from the rx end. The rx end is special in that receivers can also
+/// receive from the rx end using [`Receiver::try_recv`] method.
 ///
 /// # Receivers
 ///
 /// While [`CircBuf`] doesn't implement `Sync`, it can create [`Receiver`]s using the method
-/// [`receiver`][receiver], and those can be easily shared among multiple threads. [`Receiver`]s can
-/// only [`try_recv`][Receiver::try_recv] elements from the rx end of the circular buffer.
+/// [`receiver`], and those can be easily shared among multiple threads. [`Receiver`]s can only
+/// [`Receiver::try_recv`] elements from the rx end of the circular buffer.
 ///
 /// # Capacity
 ///
@@ -264,9 +263,9 @@ impl<T> Drop for Inner<T> {
 /// [`CircBuf`]: struct.CircBuf.html
 /// [`Receiver`]: struct.Receiver.html
 /// [`send`]: struct.CircBuf.html#method.send
-/// [receiver]: struct.CircBuf.html#method.receiver
-/// [CircBuf::try_recv]: struct.CircBuf.html#method.try_recv
-/// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
+/// [`receiver`]: struct.CircBuf.html#method.receiver
+/// [`CircBuf::try_recv`]: struct.CircBuf.html#method.try_recv
+/// [`Receiver::try_recv`]: struct.Receiver.html#method.try_recv
 pub struct CircBuf<T> {
     /// Internal data of the underlying circular buffer.
     inner: Arc<Inner<T>>,
@@ -483,14 +482,14 @@ impl<T> fmt::Debug for CircBuf<T> {
 /// A dynamic-sized concurrent circular buffer.
 ///
 /// A circular buffer has two ends: rx and tx. Elements can be [`send`]ed into the tx end and
-/// [`try_recv`][DynamicCircBuf::try_recv]ed from the rx end. The rx end is special in that
-/// receivers can also receive from the rx end using [`try_recv`][Receiver::try_recv] method.
+/// [`DynamicCircBuf::try_recv`]ed from the rx end. The rx end is special in that receivers can also
+/// receive from the rx end using [`Receiver::try_recv`] method.
 ///
 /// # Receivers
 ///
 /// While [`DynamicCircBuf`] doesn't implement `Sync`, it can create [`Receiver`]s using the method
-/// [`receiver`][receiver], and those can be easily shared among multiple threads. [`Receiver`]s can
-/// only [`try_recv`][Receiver::try_recv] elements from the rx end of the circular buffer.
+/// [`receiver`], and those can be easily shared among multiple threads. [`Receiver`]s can only
+/// [`Receiver::try_recv`] elements from the rx end of the circular buffer.
 ///
 /// # Capacity
 ///
@@ -507,10 +506,10 @@ impl<T> fmt::Debug for CircBuf<T> {
 /// [`DynamicCircBuf`]: struct.DynamicCircBuf.html
 /// [`Receiver`]: struct.Receiver.html
 /// [`send`]: struct.DynamicCircBuf.html#method.send
-/// [receiver]: struct.DynamicCircBuf.html#method.receiver
+/// [`receiver`]: struct.DynamicCircBuf.html#method.receiver
 /// [`DynamicCircBuf::with_min_capacity`]: struct.DynamicCircBuf.html#method.with_min_capacity
-/// [DynamicCircBuf::try_recv]: struct.DynamicCircBuf.html#method.try_recv
-/// [Receiver::try_recv]: struct.Receiver.html#method.try_recv
+/// [`DynamicCircBuf::try_recv`]: struct.DynamicCircBuf.html#method.try_recv
+/// [`Receiver::try_recv`]: struct.Receiver.html#method.try_recv
 pub struct DynamicCircBuf<T> {
     /// The underlying circular buffer.
     inner: CircBuf<T>,

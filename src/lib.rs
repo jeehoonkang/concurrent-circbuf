@@ -14,5 +14,7 @@ extern crate crossbeam_utils as utils;
 extern crate memoffset;
 
 pub mod base;
+pub use base::TryRecv;
+
 pub mod bounded;
 pub mod unbounded;
