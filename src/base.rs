@@ -54,7 +54,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicIsize;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use epoch::{self, Atomic, Owned};
@@ -78,7 +78,7 @@ impl<T, U> CPair<T, U> {
 struct Array<T> {
     /// Pointer to the allocated memory. The value `(i, v)` means the `i`-th value `v` of the
     /// buffer.
-    ptr: *mut CPair<AtomicIsize, T>,
+    ptr: *mut CPair<AtomicUsize, T>,
 
     /// Capacity of the array. Always a power of two.
     cap: usize,
@@ -94,7 +94,7 @@ impl<T> Array<T> {
 
         // Creates an array and gets its raw pointer.
         let mut v = Vec::with_capacity(cap);
-        let ptr: *mut CPair<AtomicIsize, T> = v.as_mut_ptr();
+        let ptr: *mut CPair<AtomicUsize, T> = v.as_mut_ptr();
         mem::forget(v);
 
         // Mark all entries invalid. Concretely, for each entry at `i`, we put the index `i - 1`,
@@ -104,7 +104,7 @@ impl<T> Array<T> {
             for i in 0..cap {
                 ptr::write(
                     ptr.offset(i as isize),
-                    CPair::new(AtomicIsize::new(i as isize - 1), mem::uninitialized()),
+                    CPair::new(AtomicUsize::new(i + 1), mem::uninitialized()),
                 );
             }
         }
@@ -113,34 +113,34 @@ impl<T> Array<T> {
     }
 
     /// Returns a pointer to the element at the specified `index`.
-    unsafe fn at(&self, index: isize) -> *mut CPair<AtomicIsize, T> {
+    unsafe fn at(&self, index: usize) -> *mut CPair<AtomicUsize, T> {
         // `self.cap` is always a power of two.
-        self.ptr.offset(index & (self.cap - 1) as isize)
+        self.ptr.offset((index & (self.cap - 1)) as isize)
     }
 
     /// Writes `value` into the specified `index`.
-    unsafe fn write(&self, index: isize, value: T) {
+    unsafe fn write(&self, index: usize, value: T) {
         let ptr = self.at(index) as *const u8;
 
         // Write the value.
         ptr::write(
-            ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as *mut T,
+            ptr.offset(offset_of!(CPair<usize, T>, second) as isize) as *mut T,
             value,
         );
 
         // Write the index with `Release`.
-        (*(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const AtomicIsize))
+        (*(ptr.offset(offset_of!(CPair<usize, T>, first) as isize) as *const AtomicUsize))
             .store(index, Ordering::Release);
     }
 
     /// Reads a value from the specified `index`.
     ///
     /// Returns `Some(v)` if `v` is at `index`, and `None` if there is no valid value for `index`.
-    unsafe fn read(&self, index: isize) -> Option<T> {
+    unsafe fn read(&self, index: usize) -> Option<T> {
         let ptr = self.at(index) as *const u8;
 
         // Read the index with `Acquire`.
-        let i = (*(ptr.offset(offset_of!(CPair<isize, T>, first) as isize) as *const AtomicIsize))
+        let i = (*(ptr.offset(offset_of!(CPair<usize, T>, first) as isize) as *const AtomicUsize))
             .load(Ordering::Acquire);
 
         // If the index written in the array mismatches with the queried index, there's no valid
@@ -151,7 +151,7 @@ impl<T> Array<T> {
 
         // Read the value.
         Some(ptr::read(
-            ptr.offset(offset_of!(CPair<isize, T>, second) as isize) as *const T,
+            ptr.offset(offset_of!(CPair<usize, T>, second) as isize) as *const T,
         ))
     }
 }
@@ -194,10 +194,10 @@ impl<T> TryRecv<T> {
 /// Internal data shared among a circular buffer and its receivers.
 struct Inner<T> {
     /// The rx index.
-    rx: CachePadded<AtomicIsize>,
+    rx: CachePadded<AtomicUsize>,
 
     /// The tx index.
-    tx: CachePadded<AtomicIsize>,
+    tx: CachePadded<AtomicUsize>,
 
     /// The underlying array.
     array: Atomic<Array<T>>,
@@ -209,8 +209,8 @@ impl<T> Inner<T> {
         debug_assert_eq!(cap, cap.next_power_of_two());
 
         Inner {
-            rx: CachePadded::new(AtomicIsize::new(0)),
-            tx: CachePadded::new(AtomicIsize::new(0)),
+            rx: CachePadded::new(AtomicUsize::new(0)),
+            tx: CachePadded::new(AtomicUsize::new(0)),
             array: Atomic::new(Array::new(cap)),
         }
     }
@@ -265,7 +265,7 @@ pub struct CircBuf<T> {
     inner: Arc<Inner<T>>,
 
     /// The lower bound of the rx end in the view of the sender.
-    rx_lb: Cell<isize>,
+    rx_lb: Cell<usize>,
 
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
@@ -350,7 +350,7 @@ impl<T> CircBuf<T> {
     /// [`CircBuf::send`]: struct.CircBuf.html#method.send
     /// [`DynamicCircBuf::send`]: struct.DynamicCircBuf.html#method.send
     #[inline]
-    fn send_inner(&self, value: T) -> Result<(), (T, isize, usize)> {
+    fn send_inner(&self, value: T) -> Result<(), (T, usize, usize)> {
         unsafe {
             // Load rx, tx, and array. The array doesn't have to be epoch-protected because the
             // current thread (the worker) is the only one that grows and shrinks it.
@@ -365,12 +365,12 @@ impl<T> CircBuf<T> {
             let cap = array.deref().cap;
 
             // If the circular buffer is full, grow the underlying array.
-            if len >= cap as isize {
+            if len >= cap as usize {
                 let rx = self.inner.rx.load(Ordering::Acquire);
                 self.rx_lb.set(rx);
                 let len = tx.wrapping_sub(rx);
 
-                if len >= cap as isize {
+                if len >= cap as usize {
                     return Err((value, tx, cap));
                 }
             }
@@ -428,7 +428,7 @@ impl<T> CircBuf<T> {
 
             // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
             let cap = array.deref().cap;
-            let resize = if len <= cap as isize / 4 {
+            let resize = if len <= cap as usize / 4 {
                 Some(cap)
             } else {
                 None
