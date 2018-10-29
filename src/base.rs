@@ -53,9 +53,9 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use epoch::{self, Atomic, Owned};
 use utils::CachePadded;
@@ -354,7 +354,8 @@ impl<T> CircBuf<T> {
         unsafe {
             // Load rx, tx, and array. The array doesn't have to be epoch-protected because the
             // current thread (the worker) is the only one that grows and shrinks it.
-            let array = self.inner
+            let array = self
+                .inner
                 .array
                 .load(Ordering::Relaxed, epoch::unprotected());
             let tx = self.inner.tx.load(Ordering::Relaxed);
@@ -405,7 +406,8 @@ impl<T> CircBuf<T> {
 
         // Try incrementing rx to receive a value.
         let rx_new = rx.wrapping_add(1);
-        if self.inner
+        if self
+            .inner
             .rx
             .compare_exchange_weak(rx, rx_new, Ordering::Relaxed, Ordering::Relaxed)
             .map_err(|rx_cur| self.rx_lb.set(rx_cur))
@@ -419,7 +421,8 @@ impl<T> CircBuf<T> {
 
         // Load the value at the rx end of the array.
         unsafe {
-            let array = self.inner
+            let array = self
+                .inner
                 .array
                 .load(Ordering::Relaxed, epoch::unprotected());
 
@@ -580,7 +583,8 @@ impl<T> DynamicCircBuf<T> {
             .unwrap_or_else(|(value, tx, cap)| unsafe {
                 // The circular buffer is full. Grow the array.
                 self.resize(2 * cap);
-                let array = self.inner
+                let array = self
+                    .inner
                     .inner
                     .array
                     .load(Ordering::Relaxed, epoch::unprotected());
@@ -765,7 +769,8 @@ impl<T> Receiver<T> {
         };
 
         // Try incrementing rx to receive the value.
-        if self.inner
+        if self
+            .inner
             .rx
             .compare_exchange(rx, rx.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
             .is_err()
@@ -846,10 +851,15 @@ impl<T> Receiver<T> {
         }
 
         // Try incrementing rx to receive the values.
-        if self.inner
+        if self
+            .inner
             .rx
-            .compare_exchange(rx, rx.wrapping_add(num), Ordering::Release, Ordering::Relaxed)
-            .is_err()
+            .compare_exchange(
+                rx,
+                rx.wrapping_add(num),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ).is_err()
         {
             // We didn't receive this value, forget it.
             mem::forget(values);
@@ -934,13 +944,13 @@ impl<T> fmt::Debug for Receiver<T> {
 mod tests {
     extern crate rand;
 
-    use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use epoch;
     use self::rand::Rng;
+    use epoch;
 
     use super::{DynamicCircBuf, TryRecv};
 
@@ -1019,7 +1029,9 @@ mod tests {
                         i += 1;
                     }
 
-                    if i == STEPS { break; }
+                    if i == STEPS {
+                        break;
+                    }
                 }
             }
         });
@@ -1056,8 +1068,7 @@ mod tests {
                         }
                     }
                 })
-            })
-            .collect::<Vec<_>>();
+            }).collect::<Vec<_>>();
 
         while remaining.load(SeqCst) > 0 {
             if let TryRecv::Data(_) = cb.try_recv() {
@@ -1090,8 +1101,7 @@ mod tests {
                         }
                     }
                 })
-            })
-            .collect::<Vec<_>>();
+            }).collect::<Vec<_>>();
 
         let mut rng = rand::thread_rng();
         let mut expected = 0;
@@ -1154,8 +1164,7 @@ mod tests {
                 };
 
                 (t, hits)
-            })
-            .unzip();
+            }).unzip();
 
         let mut rng = rand::thread_rng();
         let mut my_hits = 0;
@@ -1213,8 +1222,7 @@ mod tests {
                         }
                     }
                 })
-            })
-            .collect::<Vec<_>>();
+            }).collect::<Vec<_>>();
 
         for _ in 0..1000 {
             if let TryRecv::Data(_) = cb.try_recv() {
