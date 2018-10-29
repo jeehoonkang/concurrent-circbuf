@@ -58,7 +58,7 @@ use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering;
 
 use epoch::{self, Atomic, Owned};
-use utils::cache_padded::CachePadded;
+use utils::CachePadded;
 
 /// C++'s std::pair<T, U>.
 #[repr(C)]
@@ -684,7 +684,7 @@ impl<T> DynamicCircBuf<T> {
         inner.array.store(new, Ordering::Release);
 
         // Destroy the old array later.
-        guard.defer(move || array.into_owned());
+        guard.defer_destroy(array);
 
         // If the array is very large, then flush the thread-local garbage in order to
         // deallocate it as soon as possible.

@@ -12,9 +12,9 @@ keywords = ["circular", "ring", "spsc", "spmc", "channel"]
 categories = ["algorithms", "concurrency", "data-structures"]
 
 [dependencies]
-crossbeam-epoch = "0.4.0"
-crossbeam-utils = "0.3.2"
+crossbeam-epoch = "0.6"
+crossbeam-utils = "0.5"
 memoffset = "0.2"
 
 [dev-dependencies]
-rand = "0.4"
+rand = "0.5"
