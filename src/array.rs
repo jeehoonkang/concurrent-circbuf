@@ -13,11 +13,6 @@ pub struct CPair<T, U> {
 }
 
 impl<T, U> CPair<T, U> {
-    /// C++'s std::make_pair<T, U>.
-    pub fn new(first: T, second: U) -> Self {
-        Self { first, second }
-    }
-
     pub fn fst_mut(ptr: *mut Self) -> *mut T {
         unsafe {
             let ptr = ptr as *mut u8;
@@ -61,10 +56,11 @@ impl<T> Array<T> {
         // index `i + N * cap`, where `N` is an integer.
         unsafe {
             for i in 0..cap {
-                ptr::write(
-                    ptr.add(i),
-                    CPair::new(AtomicUsize::new(i + 1), mem::uninitialized()),
-                );
+                // FIXME: use `MaybeUninit` when it's stabilized:
+                // https://github.com/rust-lang/rust/issues/53491
+                let mut slot: CPair<AtomicUsize, _> = mem::uninitialized();
+                slot.first = AtomicUsize::new(i + 1);
+                ptr::write(ptr.add(i), slot);
             }
         }
 
