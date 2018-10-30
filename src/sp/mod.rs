@@ -1,4 +1,4 @@
-//! A concurrent circular buffer.
+//! Concurrent single-producer channels based on circular buffer.
 //!
 //! [`CircBuf`] is a circular buffer, which is basically a fixed-sized array that has two ends: tx
 //! and rx. A [`CircBuf`] can [`send`] elements into the tx end and [`CircBuf::try_recv`] elements
@@ -60,6 +60,9 @@ use utils::CachePadded;
 
 use array::Array;
 pub use TryRecv;
+
+pub mod sc;
+pub mod mc;
 
 /// Internal data shared among a circular buffer and its receivers.
 struct Inner<T> {

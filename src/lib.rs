@@ -16,9 +16,11 @@ extern crate memoffset;
 mod array;
 #[doc(hidden)] // for doc-tests
 pub mod sp;
+#[doc(hidden)] // for doc-tests
+pub mod mp;
 
-pub mod bounded;
-pub mod unbounded;
+pub use sp::sc as spsc;
+pub use sp::mc as spmc;
 
 /// The return type for [`CircBuf::try_recv`], [`DynamicCircBuf::try_recv`], and
 /// [`Receiver::try_recv`].
