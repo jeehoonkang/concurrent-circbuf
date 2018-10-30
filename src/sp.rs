@@ -58,144 +58,8 @@ use std::sync::Arc;
 use epoch::{self, Atomic, Owned};
 use utils::CachePadded;
 
-/// C++'s std::pair<T, U>.
-#[repr(C)]
-struct CPair<T, U> {
-    pub first: T,
-    pub second: U,
-}
-
-impl<T, U> CPair<T, U> {
-    /// C++'s std::make_pair<T, U>.
-    pub fn new(first: T, second: U) -> Self {
-        Self { first, second }
-    }
-
-    pub fn fst_mut(ptr: *mut Self) -> *mut T {
-        unsafe {
-            let ptr = ptr as *mut u8;
-            ptr.add(offset_of!(Self, first)) as *mut T
-        }
-    }
-
-    pub fn snd_mut(ptr: *mut Self) -> *mut U {
-        unsafe {
-            let ptr = ptr as *mut u8;
-            ptr.add(offset_of!(Self, second)) as *mut U
-        }
-    }
-}
-
-/// An array that holds elements in a circular buffer.
-struct Array<T> {
-    /// Pointer to the allocated memory. The value `(i, v)` means the `i`-th value `v` of the
-    /// buffer.
-    ptr: *mut CPair<AtomicUsize, T>,
-
-    /// Capacity of the array. Always a power of two.
-    cap: usize,
-}
-
-unsafe impl<T> Send for Array<T> {}
-
-impl<T> Array<T> {
-    /// Returns a new array with the specified capacity.
-    fn new(cap: usize) -> Self {
-        // `cap` should be a power of two.
-        debug_assert_eq!(cap, cap.next_power_of_two());
-
-        // Creates an array and gets its raw pointer.
-        let mut v = Vec::with_capacity(cap);
-        let ptr: *mut CPair<AtomicUsize, T> = v.as_mut_ptr();
-        mem::forget(v);
-
-        // Mark all entries invalid. Concretely, for each entry at `i`, we put the index `i + 1`,
-        // which is invalid. This is because the `i`-th entry can contain only elements with the
-        // index `i + N * cap`, where `N` is an integer.
-        unsafe {
-            for i in 0..cap {
-                ptr::write(
-                    ptr.add(i),
-                    CPair::new(AtomicUsize::new(i + 1), mem::uninitialized()),
-                );
-            }
-        }
-
-        Array { ptr, cap }
-    }
-
-    /// Returns a pointer to the element at the specified `index`.
-    unsafe fn at(&self, index: usize) -> *mut CPair<AtomicUsize, T> {
-        // `self.cap` is always a power of two.
-        self.ptr.add(index & (self.cap - 1))
-    }
-
-    /// Writes `value` into the specified `index`.
-    unsafe fn write(&self, index: usize, value: T) {
-        let ptr = self.at(index);
-
-        // Write the value.
-        ptr::write(CPair::snd_mut(ptr), value);
-
-        // Write the index with `Release`.
-        (*CPair::fst_mut(ptr)).store(index, Ordering::Release);
-    }
-
-    /// Reads a value from the specified `index`.
-    ///
-    /// Returns `Some(v)` if `v` is at `index`, and `None` if there is no valid value for `index`.
-    unsafe fn read(&self, index: usize) -> Option<T> {
-        let ptr = self.at(index);
-
-        // Read the index with `Acquire`.
-        let i = (*CPair::fst_mut(ptr)).load(Ordering::Acquire);
-
-        // If the index written in the array mismatches with the queried index, there's no valid
-        // value.
-        if index != i {
-            return None;
-        }
-
-        // Read the value.
-        Some(ptr::read(CPair::snd_mut(ptr)))
-    }
-}
-
-impl<T> Drop for Array<T> {
-    fn drop(&mut self) {
-        // Array itself doesn't claim any ownership of the values.
-        unsafe {
-            drop(Vec::from_raw_parts(self.ptr, 0, self.cap));
-        }
-    }
-}
-
-/// The return type for [`CircBuf::try_recv`], [`DynamicCircBuf::try_recv`], and
-/// [`Receiver::try_recv`].
-///
-/// [`CircBuf::try_recv`]: struct.CircBuf.html#method.try_recv
-/// [`DynamicCircBuf::try_recv`]: struct.DynamicCircBuf.html#method.try_recv
-/// [`Receiver::try_recv`]: struct.Receiver.html#method.try_recv
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TryRecv<T> {
-    /// `try_recv` received an element.
-    Data(T),
-    /// The circular buffer is empty.
-    Empty,
-    /// Lost the race for receiving data to another concurrent operation. Try again.
-    Retry,
-}
-
-impl<T> TryRecv<T> {
-    /// Apply a function to the content of `TryRecv::Data`.
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> TryRecv<U> {
-        match self {
-            TryRecv::Data(v) => TryRecv::Data(f(v)),
-            TryRecv::Empty => TryRecv::Empty,
-            TryRecv::Retry => TryRecv::Retry,
-        }
-    }
-}
+use array::Array;
+pub use TryRecv;
 
 /// Internal data shared among a circular buffer and its receivers.
 struct Inner<T> {
@@ -286,7 +150,7 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::CircBuf;
+    /// use concurrent_circbuf::sp::CircBuf;
     ///
     /// // The capacity will be rounded up to 1024.
     /// let cb = CircBuf::<i32>::new(1000);
@@ -310,7 +174,7 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::CircBuf;
+    /// use concurrent_circbuf::sp::CircBuf;
     ///
     /// let cb = CircBuf::new(16);
     /// cb.send(1).unwrap();
@@ -330,7 +194,7 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
+    /// use concurrent_circbuf::sp::{CircBuf, TryRecv};
     ///
     /// let cb = CircBuf::new(16);
     /// cb.send(1).unwrap();
@@ -452,7 +316,7 @@ impl<T> CircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{CircBuf, TryRecv};
+    /// use concurrent_circbuf::sp::{CircBuf, TryRecv};
     /// use std::thread;
     ///
     /// let cb = CircBuf::new(16);
@@ -538,7 +402,7 @@ impl<T> DynamicCircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::DynamicCircBuf;
+    /// use concurrent_circbuf::sp::DynamicCircBuf;
     ///
     /// let cb = DynamicCircBuf::<i32>::new();
     /// ```
@@ -553,7 +417,7 @@ impl<T> DynamicCircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::DynamicCircBuf;
+    /// use concurrent_circbuf::sp::DynamicCircBuf;
     ///
     /// // The minimum capacity will be rounded up to 1024.
     /// let cb = DynamicCircBuf::<i32>::with_min_capacity(1000);
@@ -577,7 +441,7 @@ impl<T> DynamicCircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::DynamicCircBuf;
+    /// use concurrent_circbuf::sp::DynamicCircBuf;
     ///
     /// let cb = DynamicCircBuf::new();
     /// cb.send(1);
@@ -617,7 +481,7 @@ impl<T> DynamicCircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    /// use concurrent_circbuf::sp::{DynamicCircBuf, TryRecv};
     ///
     /// let cb = DynamicCircBuf::new();
     /// cb.send(1);
@@ -651,7 +515,7 @@ impl<T> DynamicCircBuf<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    /// use concurrent_circbuf::sp::{DynamicCircBuf, TryRecv};
     /// use std::thread;
     ///
     /// let cb = DynamicCircBuf::new();
@@ -747,7 +611,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    /// use concurrent_circbuf::sp::{DynamicCircBuf, TryRecv};
     ///
     /// let cb = DynamicCircBuf::new();
     /// let r = cb.receiver();
@@ -807,7 +671,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    /// use concurrent_circbuf::sp::{DynamicCircBuf, TryRecv};
     ///
     /// let cb = DynamicCircBuf::new();
     /// let r = cb.receiver();
@@ -899,7 +763,7 @@ impl<T> Receiver<T> {
     /// # Examples
     ///
     /// ```
-    /// use concurrent_circbuf::base::{DynamicCircBuf, TryRecv};
+    /// use concurrent_circbuf::sp::{DynamicCircBuf, TryRecv};
     ///
     /// let cb = DynamicCircBuf::new();
     /// let r = cb.receiver();
