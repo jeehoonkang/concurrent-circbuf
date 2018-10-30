@@ -5,18 +5,23 @@
 <!-- [![Cargo](https://img.shields.io/crates/v/crossbeam-epoch.svg)](https://crates.io/crates/crossbeam-epoch) -->
 <!-- [![Documentation](https://docs.rs/crossbeam-epoch/badge.svg)](https://docs.rs/crossbeam-epoch) -->
 
+**CAVEAT: This crate is WIP**, and is not yet available in [crates.io](https://crates.io).
+
 This crate provides concurrent channels based on circular buffer.
 
 ## Usage
 
-This crate is WIP, and is not yet available in [crates.io](https://crates.io).
-
-<!-- Add this to your `Cargo.toml`: -->
+Add this to your `Cargo.toml`:
 
 <!-- ```toml -->
 <!-- [dependencies] -->
-<!-- crossbeam-epoch = "0.4" -->
+<!-- concurrent-circbuf = "0.1" -->
 <!-- ``` -->
+
+```toml
+[dependencies]
+concurrent-circbuf = { git = "https://github.com/jeehoonkang/concurrent-circbuf.git" }
+```
 
 Next, add this to your crate:
 
