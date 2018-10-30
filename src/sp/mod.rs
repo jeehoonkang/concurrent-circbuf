@@ -50,6 +50,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -61,8 +62,8 @@ use utils::CachePadded;
 use array::Array;
 pub use TryRecv;
 
-pub mod sc;
 pub mod mc;
+pub mod sc;
 
 /// Internal data shared among a circular buffer and its receivers.
 struct Inner<T> {
@@ -409,6 +410,7 @@ impl<T> DynamicCircBuf<T> {
     ///
     /// let cb = DynamicCircBuf::<i32>::new();
     /// ```
+    #[inline]
     pub fn new() -> DynamicCircBuf<T> {
         Self::with_min_capacity(Self::DEFAULT_MIN_CAP)
     }
@@ -643,7 +645,7 @@ impl<T> Receiver<T> {
             let array = self.inner.array.load_consume(guard);
             match unsafe { array.deref().read(rx) } {
                 None => return TryRecv::Empty,
-                Some(value) => value,
+                Some(value) => ManuallyDrop::new(value),
             }
         };
 
@@ -654,12 +656,10 @@ impl<T> Receiver<T> {
             .compare_exchange(rx, rx.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
             .is_err()
         {
-            // We didn't receive this value, forget it.
-            mem::forget(value);
             return TryRecv::Retry;
         }
 
-        TryRecv::Data(value)
+        TryRecv::Data(ManuallyDrop::into_inner(value))
     }
 
     /// Receives half the elements from the rx end of its circular buffer.
@@ -706,23 +706,23 @@ impl<T> Receiver<T> {
         // Calculate the number of elements to receive.
         let num = ((len + 1) / 2) as usize;
 
-        // Load the values at [rx, rx + max).
+        // Load the values at [rx, rx + num).
         let values = {
-            let mut values: Vec<T> = Vec::with_capacity(num as usize);
             let guard = &epoch::pin();
             let array = unsafe { self.inner.array.load_consume(guard).deref() };
-            for i in 0..num {
-                match unsafe { array.read(rx.wrapping_add(i)) } {
-                    Some(v) => values.push(v),
-                    None => {
-                        // `None` means the buffer is already wrapped around, because we already
-                        // acknowledged the values in the range [rx, tx) thanks to release/acquire
-                        // synchronization via `tx`.
-                        return TryRecv::Retry;
-                    }
-                }
+            (0..num)
+                .map(|i| unsafe { array.read(rx.wrapping_add(i)).map(ManuallyDrop::new) })
+                .collect::<Option<Vec<ManuallyDrop<T>>>>()
+        };
+
+        let values = match values {
+            None => {
+                // `None` means the buffer is already wrapped around, because we already
+                // acknowledged the values in the range [rx, tx) thanks to release/acquire
+                // synchronization via `tx`.
+                return TryRecv::Retry;
             }
-            values
+            Some(values) => values,
         };
 
         if values.is_empty() {
@@ -741,11 +741,10 @@ impl<T> Receiver<T> {
             ).is_err()
         {
             // We didn't receive this value, forget it.
-            mem::forget(values);
             return TryRecv::Retry;
         }
 
-        TryRecv::Data(values)
+        TryRecv::Data(values.into_iter().map(ManuallyDrop::into_inner).collect())
     }
 
     /// Receives an element from the rx end of its circular buffer.
