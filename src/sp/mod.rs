@@ -268,7 +268,7 @@ impl<T> CircBuf<T> {
     fn try_recv_inner(&self) -> TryRecv<(T, Option<usize>)> {
         // Load tx and rx.
         let tx = self.inner.tx.load(Ordering::Relaxed);
-        let rx = self.inner.rx.load(Ordering::Relaxed);
+        let rx = self.inner.rx.load(Ordering::Acquire);
         let len = tx.wrapping_sub(rx) as isize;
 
         // Is the circular buffer empty?
@@ -282,7 +282,7 @@ impl<T> CircBuf<T> {
         if self
             .inner
             .rx
-            .compare_exchange_weak(rx, rx_new, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange_weak(rx, rx_new, Ordering::Acquire, Ordering::Acquire)
             .map_err(|rx_cur| self.rx_lb.set(rx_cur))
             .is_err()
         {
