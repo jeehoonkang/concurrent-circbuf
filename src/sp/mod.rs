@@ -56,14 +56,14 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use epoch::{self, Atomic, Owned};
+use epoch;
 use utils::CachePadded;
 
 mod array;
 pub mod mc;
 pub mod sc;
 
-use self::array::{Array, ArrayBox};
+use self::array::{ArrayBox, AtomicArray, OwnedArray};
 pub use TryRecv;
 
 /// Internal data shared among a circular buffer and its receivers.
@@ -75,7 +75,7 @@ struct Inner<T> {
     tx: CachePadded<AtomicUsize>,
 
     /// The underlying array.
-    array: Atomic<Array<T>, ArrayBox<T>>,
+    array: AtomicArray<T>,
 }
 
 impl<T> Inner<T> {
@@ -86,7 +86,7 @@ impl<T> Inner<T> {
         Inner {
             rx: CachePadded::new(AtomicUsize::new(0)),
             tx: CachePadded::new(AtomicUsize::new(0)),
-            array: Atomic::from(ArrayBox::new(cap)),
+            array: AtomicArray::from(ArrayBox::new(cap)),
         }
     }
 }
@@ -558,7 +558,7 @@ impl<T> DynamicCircBuf<T> {
         }
 
         let guard = &epoch::pin();
-        let new = Owned::<Array<_>, _>::from(new).into_shared(guard);
+        let new = OwnedArray::from(new).into_shared(guard);
 
         // Store the new array.
         inner.array.store(new, Ordering::Release);

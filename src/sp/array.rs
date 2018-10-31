@@ -4,7 +4,10 @@ use std::ptr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use epoch::{self, Storage};
+use epoch::{self, AtomicTmpl, OwnedTmpl, Storage};
+
+pub type AtomicArray<T> = AtomicTmpl<Array<T>, ArrayBox<T>>;
+pub type OwnedArray<T> = OwnedTmpl<Array<T>, ArrayBox<T>>;
 
 #[derive(Debug)]
 pub struct Slot<T> {
