@@ -10,10 +10,7 @@
 
 extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils as utils;
-#[macro_use]
-extern crate memoffset;
 
-mod array;
 #[doc(hidden)] // for doc-tests
 pub mod mp;
 #[doc(hidden)] // for doc-tests

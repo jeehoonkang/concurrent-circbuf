@@ -50,20 +50,85 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
+use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use epoch::{self, Atomic, Owned};
+use epoch::{self, Atomic, Owned, Array, ArrayBox};
 use utils::CachePadded;
 
-use array::Array;
 pub use TryRecv;
 
 pub mod mc;
 pub mod sc;
+
+#[derive(Debug)]
+pub struct Slot<T> {
+    index: AtomicUsize,
+    data: UnsafeCell<T>,
+}
+
+mod indexed_array {
+    use super::*;
+
+    pub fn new<T>(cap: usize) -> ArrayBox<Slot<T>> {
+        // `cap` should be a power of two.
+        debug_assert_eq!(cap, cap.next_power_of_two());
+
+        // Creates an array.
+        let array = ArrayBox::<Slot<T>>::new(cap);
+
+        // Mark all entries invalid. Concretely, for each entry at `i`, we put the index `i + 1`, which
+        // is invalid. This is because the `i`-th entry can contain only elements with the index `i + N
+        // * cap`, where `N` is an integer.
+        unsafe {
+            for i in 0..cap {
+                let index = &(*array.at(i)).index as *const _ as *mut AtomicUsize;
+                ptr::write(index, AtomicUsize::new(i + 1));
+            }
+        }
+
+        array
+    }
+
+    pub unsafe fn at<T>(array: &Array<Slot<T>>, index: usize) -> *mut Slot<T> {
+        // `array.size()` is always a power of two.
+        &*array.at(index & (array.size() - 1)) as &Slot<T> as *const _ as *mut Slot<T>
+    }
+
+    /// Reads a value from the specified `index`.
+    ///
+    /// Returns `Some(v)` if `v` is at `index`, and `None` if there is no valid value for `index`.
+    pub unsafe fn read<T>(array: &Array<Slot<T>>, index: usize) -> Option<T> {
+        let ptr = at(array, index);
+
+        // Read the index with `Acquire`.
+        let i = (*ptr).index.load(Ordering::Acquire);
+
+        // If the index written in the array mismatches with the queried index, there's no valid
+        // value.
+        if index != i {
+            return None;
+        }
+
+        // Read the value.
+        Some((*ptr).data.get().read())
+    }
+
+    /// Writes `value` into the specified `index`.
+    pub unsafe fn write<T>(array: &Array<Slot<T>>, index: usize, value: T) {
+        let ptr = at(array, index);
+
+        // Write the value.
+        (*ptr).data.get().write(value);
+
+        // Write the index with `Release`.
+        (*ptr).index.store(index, Ordering::Release);
+    }
+}
 
 /// Internal data shared among a circular buffer and its receivers.
 struct Inner<T> {
@@ -74,7 +139,7 @@ struct Inner<T> {
     tx: CachePadded<AtomicUsize>,
 
     /// The underlying array.
-    array: Atomic<Array<T>>,
+    array: Atomic<Array<Slot<T>>, ArrayBox<Slot<T>>>,
 }
 
 impl<T> Inner<T> {
@@ -85,7 +150,7 @@ impl<T> Inner<T> {
         Inner {
             rx: CachePadded::new(AtomicUsize::new(0)),
             tx: CachePadded::new(AtomicUsize::new(0)),
-            array: Atomic::new(Array::new(cap)),
+            array: Atomic::from(indexed_array::new(cap)),
         }
     }
 }
@@ -102,7 +167,7 @@ impl<T> Drop for Inner<T> {
             // Go through the array from rx to tx and drop all elements in the circular buffer.
             let mut i = rx;
             while i != tx {
-                ptr::drop_in_place(array.deref().at(i));
+                ptr::drop_in_place(indexed_array::at(array.deref(), i));
                 i = i.wrapping_add(1);
             }
 
@@ -237,7 +302,7 @@ impl<T> CircBuf<T> {
 
             // Calculate the length and the capacity of the circular buffer.
             let len = tx.wrapping_sub(rx_lb) as isize;
-            let cap = array.deref().cap;
+            let cap = array.deref().size();
 
             // If the circular buffer is full, grow the underlying array.
             if len >= cap as isize {
@@ -251,7 +316,7 @@ impl<T> CircBuf<T> {
             }
 
             // Write `value` into the right slot and increment `tx`.
-            array.deref().write(tx, value);
+            indexed_array::write(array.deref(), tx, value);
             self.inner.tx.store(tx.wrapping_add(1), Ordering::Release);
             Ok(())
         }
@@ -301,10 +366,10 @@ impl<T> CircBuf<T> {
                 .load(Ordering::Relaxed, epoch::unprotected());
 
             // Because len > 0, we should read a valid value.
-            let value = array.deref().read(rx).unwrap();
+            let value = indexed_array::read(array.deref(), rx).unwrap();
 
             // Shrink the array if `len - 1` is less than one fourth of `self.min_cap`.
-            let cap = array.deref().cap;
+            let cap = array.deref().size();
             let resize = if len <= cap as isize / 4 {
                 Some(cap)
             } else {
@@ -465,7 +530,7 @@ impl<T> DynamicCircBuf<T> {
                     .load(Ordering::Relaxed, epoch::unprotected());
 
                 // Write `value` into the right slot and increment `tx`.
-                array.deref().write(tx, value);
+                indexed_array::write(array.deref(), tx, value);
                 self.inner
                     .inner
                     .tx
@@ -547,17 +612,21 @@ impl<T> DynamicCircBuf<T> {
         let array = inner.array.load(Ordering::Relaxed, epoch::unprotected());
 
         // Allocate a new array.
-        let new = Array::new(new_cap);
+        let new = indexed_array::new(new_cap);
 
         // Copy data from the old array to the new one.
         let mut i = rx;
         while i != tx {
-            ptr::copy_nonoverlapping(array.deref().at(i), new.at(i), 1);
+            ptr::copy_nonoverlapping(
+                indexed_array::at(array.deref(), i),
+                indexed_array::at(&new, i),
+                1,
+            );
             i = i.wrapping_add(1);
         }
 
         let guard = &epoch::pin();
-        let new = Owned::new(new).into_shared(guard);
+        let new = Owned::<Array<_>, _>::from(new).into_shared(guard);
 
         // Store the new array.
         inner.array.store(new, Ordering::Release);
@@ -643,7 +712,7 @@ impl<T> Receiver<T> {
         let value = {
             let guard = &epoch::pin();
             let array = self.inner.array.load_consume(guard);
-            match unsafe { array.deref().read(rx) } {
+            match unsafe { indexed_array::read(array.deref(), rx) } {
                 None => return TryRecv::Empty,
                 Some(value) => ManuallyDrop::new(value),
             }
@@ -711,7 +780,7 @@ impl<T> Receiver<T> {
             let guard = &epoch::pin();
             let array = unsafe { self.inner.array.load_consume(guard).deref() };
             (0..num)
-                .map(|i| unsafe { array.read(rx.wrapping_add(i)).map(ManuallyDrop::new) })
+                .map(|i| unsafe { indexed_array::read(array, rx.wrapping_add(i)).map(ManuallyDrop::new) })
                 .collect::<Option<Vec<ManuallyDrop<T>>>>()
         };
 
@@ -790,7 +859,7 @@ impl<T> Receiver<T> {
         let value = {
             let guard = &epoch::pin();
             let array = self.inner.array.load_consume(guard);
-            match array.deref().read(rx) {
+            match indexed_array::read(array.deref(), rx) {
                 None => return None,
                 Some(value) => value,
             }
