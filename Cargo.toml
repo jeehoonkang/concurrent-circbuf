@@ -12,8 +12,8 @@ keywords = ["circular", "ring", "spsc", "spmc", "channel"]
 categories = ["algorithms", "concurrency", "data-structures"]
 
 [dependencies]
-crossbeam-epoch = { git = "https://github.com/jeehoonkang/crossbeam-epoch.git", branch = "array" }
-crossbeam-utils = "0.5"
+crossbeam-epoch = { git = "https://github.com/jeehoonkang/crossbeam.git", branch = "storage" }
+crossbeam-utils = "0.6"
 memoffset = "0.2"
 
 [dev-dependencies]
