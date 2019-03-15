@@ -14,7 +14,7 @@ categories = ["algorithms", "concurrency", "data-structures"]
 [dependencies]
 crossbeam-epoch = { git = "https://github.com/jeehoonkang/crossbeam.git", branch = "storage" }
 crossbeam-utils = "0.6"
-memoffset = "0.2"
+memoffset = "0.3"
 
 [dev-dependencies]
 rand = "0.5"
